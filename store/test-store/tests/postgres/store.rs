@@ -3,6 +3,8 @@ use graph::blockchain::BlockTime;
 use graph::data::graphql::ext::TypeDefinitionExt;
 use graph::data::query::QueryTarget;
 use graph::data::subgraph::schema::DeploymentCreate;
+use graph::futures01::{future, Stream};
+use graph::futures03::compat::Future01CompatExt;
 use graph::schema::{EntityType, InputSchema};
 use graph_chain_ethereum::{Mapping, MappingABI};
 use hex_literal::hex;

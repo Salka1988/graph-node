@@ -11,6 +11,7 @@ use std::{
 };
 use std::{iter::FromIterator, time::Duration};
 
+use graph::futures03::future::join_all;
 use graph::{
     cheap_clone::CheapClone,
     components::{
@@ -24,10 +25,10 @@ use graph::{
     data::query::QueryTarget,
     data::subgraph::{schema::DeploymentCreate, status, DeploymentFeatures},
     prelude::{
-        anyhow, futures03::future::join_all, lazy_static, o, web3::types::Address, ApiVersion,
-        BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation, Logger,
-        MetricsRegistry, NodeId, PartialBlockPtr, StoreError, SubgraphDeploymentEntity,
-        SubgraphName, SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode,
+        anyhow, lazy_static, o, web3::types::Address, ApiVersion, BlockNumber, BlockPtr,
+        ChainStore, DeploymentHash, EntityOperation, Logger, MetricsRegistry, NodeId,
+        PartialBlockPtr, StoreError, SubgraphDeploymentEntity, SubgraphName,
+        SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode,
     },
     prelude::{CancelableError, StoreEvent},
     schema::{ApiSchema, InputSchema},
@@ -38,9 +39,11 @@ use graph::{
 use crate::{
     connection_pool::ConnectionPool,
     deployment::{OnSync, SubgraphHealth},
-    primary,
-    primary::{DeploymentId, Mirror as PrimaryMirror, Site},
-    relational::{index::Method, Layout},
+    primary::{self, DeploymentId, Mirror as PrimaryMirror, Site},
+    relational::{
+        index::{IndexList, Method},
+        Layout,
+    },
     writable::WritableStore,
     NotificationSender,
 };
@@ -260,6 +263,10 @@ impl SubgraphStore {
 
     pub fn notification_sender(&self) -> Arc<NotificationSender> {
         self.sender.clone()
+    }
+
+    pub fn for_site(&self, site: &Site) -> Result<&Arc<DeploymentStore>, StoreError> {
+        self.inner.for_site(site)
     }
 }
 
@@ -548,7 +555,7 @@ impl SubgraphStoreInner {
         // if the deployment already exists, we don't need to perform any copying
         // so we can set graft_base to None
         // if it doesn't exist, we need to copy the graft base to the new deployment
-        let graft_base = if !exists {
+        let graft_base_layout = if !exists {
             let graft_base = deployment
                 .graft_base
                 .as_ref()
@@ -569,13 +576,25 @@ impl SubgraphStoreInner {
             .stores
             .get(&site.shard)
             .ok_or_else(|| StoreError::UnknownShard(site.shard.to_string()))?;
+
+        let index_def = if let Some(graft) = &graft_base.clone() {
+            if let Some(site) = self.sites.get(graft) {
+                Some(deployment_store.load_indexes(site)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         deployment_store.create_deployment(
             schema,
             deployment,
             site.clone(),
-            graft_base,
+            graft_base_layout,
             replace,
             OnSync::None,
+            index_def,
         )?;
 
         let exists_and_synced = |id: &DeploymentHash| {
@@ -609,9 +628,8 @@ impl SubgraphStoreInner {
     ) -> Result<DeploymentLocator, StoreError> {
         let src = self.find_site(src.id.into())?;
         let src_store = self.for_site(src.as_ref())?;
-        let src_info = src_store.subgraph_info(src.as_ref())?;
         let src_loc = DeploymentLocator::from(src.as_ref());
-
+        let src_layout = src_store.find_layout(src.cheap_clone())?;
         let dst = Arc::new(self.primary_conn()?.copy_site(&src, shard.clone())?);
         let dst_loc = DeploymentLocator::from(dst.as_ref());
 
@@ -638,6 +656,7 @@ impl SubgraphStoreInner {
                 src_loc
             )));
         }
+        let index_def = src_store.load_indexes(src.clone())?;
 
         // Transmogrify the deployment into a new one
         let deployment = DeploymentCreate {
@@ -661,12 +680,13 @@ impl SubgraphStoreInner {
             .ok_or_else(|| StoreError::UnknownShard(shard.to_string()))?;
 
         deployment_store.create_deployment(
-            &src_info.input,
+            &src_layout.input_schema,
             deployment,
             dst.clone(),
             Some(graft_base),
             false,
             on_sync,
+            Some(index_def),
         )?;
 
         let mut pconn = self.primary_conn()?;
@@ -928,7 +948,8 @@ impl SubgraphStoreInner {
                 .ok_or_else(|| constraint_violation!("no chain info for {}", deployment_id))?;
             let latest_ethereum_block_number =
                 chain.latest_block.as_ref().map(|block| block.number());
-            let subgraph_info = store.subgraph_info(site.as_ref())?;
+            let subgraph_info = store.subgraph_info(site.cheap_clone())?;
+            let layout = store.find_layout(site.cheap_clone())?;
             let network = site.network.clone();
 
             let info = VersionInfo {
@@ -940,7 +961,7 @@ impl SubgraphStoreInner {
                 failed: status.health.is_failed(),
                 description: subgraph_info.description,
                 repository: subgraph_info.repository,
-                schema: subgraph_info.input,
+                schema: layout.input_schema.cheap_clone(),
                 network,
             };
             Ok(info)
@@ -1209,6 +1230,11 @@ impl SubgraphStoreInner {
         let src_store = self.for_site(&site)?;
         src_store.load_deployment(site)
     }
+
+    pub fn load_indexes(&self, site: Arc<Site>) -> Result<IndexList, StoreError> {
+        let src_store = self.for_site(&site)?;
+        src_store.load_indexes(site)
+    }
 }
 
 const STATE_ENS_NOT_CHECKED: u8 = 0;
@@ -1415,8 +1441,8 @@ impl SubgraphStoreTrait for SubgraphStore {
 
     fn input_schema(&self, id: &DeploymentHash) -> Result<InputSchema, StoreError> {
         let (store, site) = self.store(id)?;
-        let info = store.subgraph_info(&site)?;
-        Ok(info.input)
+        let layout = store.find_layout(site)?;
+        Ok(layout.input_schema.cheap_clone())
     }
 
     fn api_schema(
@@ -1425,7 +1451,7 @@ impl SubgraphStoreTrait for SubgraphStore {
         version: &ApiVersion,
     ) -> Result<Arc<ApiSchema>, StoreError> {
         let (store, site) = self.store(id)?;
-        let info = store.subgraph_info(&site)?;
+        let info = store.subgraph_info(site)?;
         Ok(info.api.get(version).unwrap().clone())
     }
 
@@ -1435,9 +1461,10 @@ impl SubgraphStoreTrait for SubgraphStore {
         logger: Logger,
     ) -> Result<Option<Arc<dyn SubgraphFork>>, StoreError> {
         let (store, site) = self.store(id)?;
-        let info = store.subgraph_info(&site)?;
+        let info = store.subgraph_info(site.cheap_clone())?;
+        let layout = store.find_layout(site)?;
         let fork_id = info.debug_fork;
-        let schema = info.input;
+        let schema = layout.input_schema.cheap_clone();
 
         match (self.fork_base.as_ref(), fork_id) {
             (Some(base), Some(id)) => Ok(Some(Arc::new(fork::SubgraphFork::new(
@@ -1565,7 +1592,7 @@ impl SubgraphStoreTrait for SubgraphStore {
         let site = self.find_site(deployment.id.into())?;
         let store = self.for_site(&site)?;
 
-        let info = store.subgraph_info(&site)?;
+        let info = store.subgraph_info(site)?;
         Ok(info.instrument)
     }
 }

@@ -8,16 +8,16 @@ use graph::blockchain::block_stream::FirehoseCursor;
 use graph::blockchain::BlockTime;
 use graph::components::store::write::RowGroup;
 use graph::components::store::{
-    Batch, DerivedEntityQuery, PrunePhase, PruneReporter, PruneRequest, PruningStrategy,
-    QueryPermit, StoredDynamicDataSource, VersionStats,
+    Batch, DeploymentLocator, DerivedEntityQuery, PrunePhase, PruneReporter, PruneRequest,
+    PruningStrategy, QueryPermit, StoredDynamicDataSource, VersionStats,
 };
 use graph::components::versions::VERSIONS;
 use graph::data::query::Trace;
-use graph::data::store::{Id, IdList};
+use graph::data::store::IdList;
 use graph::data::subgraph::{status, SPEC_VERSION_0_0_6};
 use graph::data_source::CausalityRegion;
 use graph::derive::CheapClone;
-use graph::prelude::futures03::FutureExt;
+use graph::futures03::FutureExt;
 use graph::prelude::{
     ApiVersion, CancelHandle, CancelToken, CancelableError, EntityOperation, PoolWaitStats,
     SubgraphDeploymentEntity,
@@ -29,8 +29,8 @@ use lru_time_cache::LruCache;
 use rand::{seq::SliceRandom, thread_rng};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Into;
-use std::ops::Bound;
 use std::ops::Deref;
+use std::ops::{Bound, DerefMut};
 use std::str::FromStr;
 use std::sync::{atomic::AtomicUsize, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -52,7 +52,7 @@ use crate::deployment::{self, OnSync};
 use crate::detail::ErrorDetail;
 use crate::dynds::DataSourcesTable;
 use crate::primary::DeploymentId;
-use crate::relational::index::{CreateIndex, Method};
+use crate::relational::index::{CreateIndex, IndexList, Method};
 use crate::relational::{Layout, LayoutCache, SqlName, Table};
 use crate::relational_queries::FromEntityData;
 use crate::{advisory_lock, catalog, retry};
@@ -74,8 +74,6 @@ pub enum ReplicaId {
 /// way as the cache lives for the lifetime of the `Store` object
 #[derive(Clone)]
 pub(crate) struct SubgraphInfo {
-    /// The schema as supplied by the user
-    pub(crate) input: InputSchema,
     /// The schema we derive from `input` with `graphql::schema::api::api_schema`
     pub(crate) api: HashMap<ApiVersion, Arc<ApiSchema>>,
     /// The block number at which this subgraph was grafted onto
@@ -174,6 +172,11 @@ impl DeploymentStore {
         DeploymentStore(Arc::new(store))
     }
 
+    // Parameter index_def is used to copy over the definition of the indexes from the source subgraph
+    // to the destination one. This happens when it is set to Some. In this case also the BTree attribude
+    // indexes are created later on, when the subgraph has synced. In case this parameter is None, all
+    // indexes are created with the default creation strategy for a new subgraph, and also from the very
+    // start.
     pub(crate) fn create_deployment(
         &self,
         schema: &InputSchema,
@@ -182,6 +185,7 @@ impl DeploymentStore {
         graft_base: Option<Arc<Layout>>,
         replace: bool,
         on_sync: OnSync,
+        index_def: Option<IndexList>,
     ) -> Result<(), StoreError> {
         let mut conn = self.get_conn()?;
         conn.transaction(|conn| -> Result<_, StoreError> {
@@ -214,6 +218,7 @@ impl DeploymentStore {
                     site.clone(),
                     schema,
                     entities_with_causality_region.into_iter().collect(),
+                    index_def,
                 )?;
                 // See if we are grafting and check that the graft is permissible
                 if let Some(base) = graft_base {
@@ -281,36 +286,25 @@ impl DeploymentStore {
         layout.query(&logger, conn, query)
     }
 
-    fn check_interface_entity_uniqueness(
+    fn check_intf_uniqueness(
         &self,
         conn: &mut PgConnection,
         layout: &Layout,
-        entity_type: &EntityType,
-        entity_id: &Id,
+        group: &RowGroup,
     ) -> Result<(), StoreError> {
-        // Collect all types that share an interface implementation with this
-        // entity type, and make sure there are no conflicting IDs.
-        //
-        // To understand why this is necessary, suppose that `Dog` and `Cat` are
-        // types and both implement an interface `Pet`, and both have instances
-        // with `id: "Fred"`. If a type `PetOwner` has a field `pets: [Pet]`
-        // then with the value `pets: ["Fred"]`, there's no way to disambiguate
-        // if that's Fred the Dog, Fred the Cat or both.
-        //
-        // This assumes that there are no concurrent writes to a subgraph.
-        let entity_type_str = entity_type.to_string();
-        let types_with_shared_interface = entity_type.share_interfaces()?;
+        let types_with_shared_interface = group.entity_type.share_interfaces()?;
+        if types_with_shared_interface.is_empty() {
+            return Ok(());
+        }
 
-        if !types_with_shared_interface.is_empty() {
-            if let Some(conflicting_entity) =
-                layout.conflicting_entity(conn, entity_id, types_with_shared_interface)?
-            {
-                return Err(StoreError::ConflictingId(
-                    entity_type_str,
-                    entity_id.to_string(),
-                    conflicting_entity,
-                ));
-            }
+        if let Some((conflicting_entity, id)) =
+            layout.conflicting_entities(conn, &types_with_shared_interface, group)?
+        {
+            return Err(StoreError::ConflictingId(
+                group.entity_type.to_string(),
+                id,
+                conflicting_entity,
+            ));
         }
         Ok(())
     }
@@ -334,10 +328,7 @@ impl DeploymentStore {
             section.end();
 
             let section = stopwatch.start_section("check_interface_entity_uniqueness");
-            for row in group.writes().filter(|emod| emod.creates_entity()) {
-                // WARNING: This will potentially execute 2 queries for each entity key.
-                self.check_interface_entity_uniqueness(conn, layout, &group.entity_type, row.id())?;
-            }
+            self.check_intf_uniqueness(conn, layout, group)?;
             section.end();
 
             let section = stopwatch.start_section("apply_entity_modifications_insert");
@@ -468,13 +459,14 @@ impl DeploymentStore {
     fn subgraph_info_with_conn(
         &self,
         conn: &mut PgConnection,
-        site: &Site,
+        site: Arc<Site>,
     ) -> Result<SubgraphInfo, StoreError> {
         if let Some(info) = self.subgraph_cache.lock().unwrap().get(&site.deployment) {
             return Ok(info.clone());
         }
 
-        let manifest_info = deployment::ManifestInfo::load(conn, site)?;
+        let layout = self.layout(conn, site.cheap_clone())?;
+        let manifest_info = deployment::ManifestInfo::load(conn, &site)?;
 
         let graft_block =
             deployment::graft_point(conn, &site.deployment)?.map(|(_, ptr)| ptr.number);
@@ -487,7 +479,7 @@ impl DeploymentStore {
 
         for version in VERSIONS.iter() {
             let api_version = ApiVersion::from_version(version).expect("Invalid API version");
-            let schema = manifest_info.input_schema.api_schema()?;
+            let schema = layout.input_schema.api_schema()?;
             api.insert(api_version, Arc::new(schema));
         }
 
@@ -500,7 +492,6 @@ impl DeploymentStore {
         };
 
         let info = SubgraphInfo {
-            input: manifest_info.input_schema,
             api,
             graft_block,
             debug_fork,
@@ -510,14 +501,16 @@ impl DeploymentStore {
             instrument: manifest_info.instrument,
         };
 
-        // Insert the schema into the cache.
-        let mut cache = self.subgraph_cache.lock().unwrap();
-        cache.insert(site.deployment.clone(), info);
-
-        Ok(cache.get(&site.deployment).unwrap().clone())
+        if ENV_VARS.store.query_stats_refresh_interval > Duration::ZERO {
+            let mut cache = self.subgraph_cache.lock().unwrap();
+            cache.insert(site.deployment.clone(), info.clone());
+            Ok(cache.get(&site.deployment).unwrap().clone())
+        } else {
+            Ok(info)
+        }
     }
 
-    pub(crate) fn subgraph_info(&self, site: &Site) -> Result<SubgraphInfo, StoreError> {
+    pub(crate) fn subgraph_info(&self, site: Arc<Site>) -> Result<SubgraphInfo, StoreError> {
         if let Some(info) = self.subgraph_cache.lock().unwrap().get(&site.deployment) {
             return Ok(info.clone());
         }
@@ -539,6 +532,17 @@ impl DeploymentStore {
     ) -> Result<Vec<DeploymentDetail>, StoreError> {
         let conn = &mut *self.get_conn()?;
         conn.transaction(|conn| -> Result<_, StoreError> { detail::deployment_details(conn, ids) })
+    }
+
+    pub fn deployment_details_for_id(
+        &self,
+        locator: &DeploymentLocator,
+    ) -> Result<DeploymentDetail, StoreError> {
+        let id = DeploymentId::from(locator.clone());
+        let conn = &mut *self.get_conn()?;
+        conn.transaction(|conn| -> Result<_, StoreError> {
+            detail::deployment_details_for_id(conn, &id)
+        })
     }
 
     pub(crate) fn deployment_statuses(
@@ -698,41 +702,16 @@ impl DeploymentStore {
     ) -> Result<(), StoreError> {
         let store = self.clone();
         let entity_name = entity_name.to_owned();
-        self.with_conn(move |mut conn, _| {
+        self.with_conn(move |conn, _| {
             let schema_name = site.namespace.clone();
-            let layout = store.layout(&mut conn, site)?;
-            let table = resolve_table_name(&layout, &entity_name)?;
-            let (column_names, index_exprs) =
-                resolve_column_names_and_index_exprs(table, &field_names)?;
-
-            let column_names_sep_by_underscores = column_names.join("_");
-            let index_exprs_joined = index_exprs.join(", ");
-            let table_name = &table.name;
-            let index_name = format!(
-                "manual_{table_name}_{column_names_sep_by_underscores}{}",
-                after.map_or_else(String::new, |a| format!("_{}", a))
-            );
-
-            let mut sql = format!(
-                "create index concurrently if not exists {index_name} \
-                 on {schema_name}.{table_name} using {index_method} \
-                 ({index_exprs_joined}) ",
-            );
-
-            // If 'after' is provided and the table is not immutable, add a WHERE clause for partial indexing
-            if let Some(after) = after {
-                if !table.immutable {
-                    sql.push_str(&format!(
-                        " where coalesce(upper({}), 2147483647) > {}",
-                        BLOCK_RANGE_COLUMN, after
-                    ));
-                } else {
-                    return Err(CancelableError::Error(StoreError::Unknown(anyhow!(
-                        "Partial index not allowed on immutable table `{}`",
-                        table_name
-                    ))));
-                }
-            }
+            let layout = store.layout(conn, site)?;
+            let (index_name, sql) = generate_index_creation_sql(
+                layout,
+                &entity_name,
+                field_names,
+                index_method,
+                after,
+            )?;
 
             // This might take a long time.
             sql_query(sql).execute(conn)?;
@@ -772,6 +751,13 @@ impl DeploymentStore {
             Ok(indexes.into_iter().map(CreateIndex::parse).collect())
         })
         .await
+    }
+
+    pub(crate) fn load_indexes(&self, site: Arc<Site>) -> Result<IndexList, StoreError> {
+        let store = self.clone();
+        let mut binding = self.get_conn()?;
+        let conn = binding.deref_mut();
+        IndexList::load(conn, site, store)
     }
 
     /// Drops an index for a given deployment, concurrently.
@@ -946,8 +932,9 @@ impl DeploymentStore {
         let indexer = *indexer;
         let site2 = site.cheap_clone();
         let store = self.cheap_clone();
-        let info = self.subgraph_info(&site)?;
-        let poi_digest = info.input.poi_digest();
+        let layout = self.find_layout(site.cheap_clone())?;
+        let info = self.subgraph_info(site.cheap_clone())?;
+        let poi_digest = layout.input_schema.poi_digest();
 
         let entities: Option<(Vec<Entity>, BlockPtr)> = self
             .with_conn(move |conn, cancel| {
@@ -993,7 +980,7 @@ impl DeploymentStore {
                         site.deployment.cheap_clone(),
                         block_ptr.number,
                         EntityCollection::All(vec![(
-                            info.input.poi_type().clone(),
+                            layout.input_schema.poi_type().clone(),
                             AttributeNames::All,
                         )]),
                     );
@@ -1397,7 +1384,7 @@ impl DeploymentStore {
         }
 
         // Don't revert past a graft point
-        let info = self.subgraph_info_with_conn(&mut conn, site.as_ref())?;
+        let info = self.subgraph_info_with_conn(&mut conn, site.cheap_clone())?;
         if let Some(graft_block) = info.graft_block {
             if graft_block > block_ptr_to.number {
                 return Err(constraint_violation!(
@@ -1510,12 +1497,12 @@ impl DeploymentStore {
         &self,
         logger: &Logger,
         site: Arc<Site>,
-        graft_src: Option<(Arc<Layout>, BlockPtr, SubgraphDeploymentEntity)>,
+        graft_src: Option<(Arc<Layout>, BlockPtr, SubgraphDeploymentEntity, IndexList)>,
     ) -> Result<(), StoreError> {
         let dst = self.find_layout(site.cheap_clone())?;
 
         // If `graft_src` is `Some`, then there is a pending graft.
-        if let Some((src, block, src_deployment)) = graft_src {
+        if let Some((src, block, src_deployment, index_list)) = graft_src {
             info!(
                 logger,
                 "Initializing graft by copying data from {} to {}",
@@ -1543,7 +1530,7 @@ impl DeploymentStore {
                 src_manifest_idx_and_name,
                 dst_manifest_idx_and_name,
             )?;
-            let status = copy_conn.copy_data()?;
+            let status = copy_conn.copy_data(index_list)?;
             if status == crate::copy::Status::Cancelled {
                 return Err(StoreError::Canceled);
             }
@@ -1615,10 +1602,17 @@ impl DeploymentStore {
                 Ok(())
             })?;
         }
+
+        let mut conn = self.get_conn()?;
+        if ENV_VARS.postpone_attribute_index_creation {
+            // check if all indexes are valid and recreate them if they aren't
+            self.load_indexes(site.clone())?
+                .recreate_invalid_indexes(&mut conn, &dst)?;
+        }
+
         // Make sure the block pointer is set. This is important for newly
         // deployed subgraphs so that we respect the 'startBlock' setting
         // the first time the subgraph is started
-        let mut conn = self.get_conn()?;
         conn.transaction(|conn| crate::deployment::initialize_block_ptr(conn, &dst.site))?;
         Ok(())
     }
@@ -1879,6 +1873,49 @@ fn resolve_table_name<'a>(layout: &'a Layout, name: &'_ str) -> Result<&'a Table
         })
 }
 
+pub fn generate_index_creation_sql(
+    layout: Arc<Layout>,
+    entity_name: &str,
+    field_names: Vec<String>,
+    index_method: Method,
+    after: Option<BlockNumber>,
+) -> Result<(String, String), StoreError> {
+    let schema_name = layout.site.namespace.clone();
+    let table = resolve_table_name(&layout, &entity_name)?;
+    let (column_names, index_exprs) = resolve_column_names_and_index_exprs(table, &field_names)?;
+
+    let column_names_sep_by_underscores = column_names.join("_");
+    let index_exprs_joined = index_exprs.join(", ");
+    let table_name = &table.name;
+    let index_name = format!(
+        "manual_{table_name}_{column_names_sep_by_underscores}{}",
+        after.map_or_else(String::new, |a| format!("_{}", a))
+    );
+
+    let mut sql = format!(
+        "create index concurrently if not exists {index_name} \
+         on {schema_name}.{table_name} using {index_method} \
+         ({index_exprs_joined}) ",
+    );
+
+    // If 'after' is provided and the table is immutable, throw an error because partial indexing is not allowed
+    if let Some(after) = after {
+        if table.immutable {
+            return Err(StoreError::Unknown(anyhow!(
+                "Partial index not allowed on immutable table `{}`",
+                table_name
+            )));
+        } else {
+            sql.push_str(&format!(
+                " where coalesce(upper({}), 2147483647) > {}",
+                BLOCK_RANGE_COLUMN, after
+            ));
+        }
+    }
+
+    Ok((index_name, sql))
+}
+
 /// Resolves column names against the `table`. The `field_names` can be
 /// either GraphQL attributes or the SQL names of columns. We also accept
 /// the names `block_range` and `block$` and map that to the correct name
@@ -1918,8 +1955,7 @@ fn resolve_column<'a>(table: &'a Table, field: &str) -> Result<(&'a SqlName, Str
                 .ok_or_else(|| StoreError::UnknownField(table.name.to_string(), field.to_string()))
         })
         .map(|column| {
-            let index_expr =
-                Table::calculate_index_method_and_expression(table.immutable, column).1;
+            let index_expr = Table::calculate_index_method_and_expression(column).1;
             (&column.name, index_expr)
         })
 }

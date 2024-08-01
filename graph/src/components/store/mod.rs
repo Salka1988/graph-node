@@ -14,8 +14,8 @@ use strum_macros::Display;
 pub use traits::*;
 pub use write::Batch;
 
-use futures::stream::poll_fn;
-use futures::{Async, Poll, Stream};
+use futures01::stream::poll_fn;
+use futures01::{Async, Poll, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -90,6 +90,7 @@ impl DerivedEntityQuery {
     /// Checks if a given key and entity match this query.
     pub fn matches(&self, key: &EntityKey, entity: &Entity) -> bool {
         key.entity_type == self.entity_type
+            && key.causality_region == self.causality_region
             && entity
                 .get(&self.entity_field)
                 .map(|v| &self.value == v)
@@ -777,7 +778,7 @@ where
 
             // Check if interval has passed since the last time we sent something.
             // If it has, start a new delay timer
-            let should_send = match futures::future::Future::poll(&mut delay) {
+            let should_send = match futures01::future::Future::poll(&mut delay) {
                 Ok(Async::NotReady) => false,
                 // Timer errors are harmless. Treat them as if the timer had
                 // become ready.

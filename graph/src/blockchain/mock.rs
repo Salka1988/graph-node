@@ -1,11 +1,12 @@
 use crate::{
+    bail,
     components::{
         link_resolver::LinkResolver,
         store::{BlockNumber, DeploymentCursorTracker, DeploymentLocator},
         subgraph::InstanceDSTemplateInfo,
     },
     data::subgraph::UnifiedMappingApiVersion,
-    data_source::DataSourceTemplateInfo,
+    prelude::{BlockHash, DataSourceTemplateInfo},
 };
 use anyhow::Error;
 use async_trait::async_trait;
@@ -82,6 +83,10 @@ impl<C: Blockchain> DataSource<C> for MockDataSource {
         vec!["mock_handler_1", "mock_handler_2"]
             .into_iter()
             .collect()
+    }
+
+    fn has_declared_calls(&self) -> bool {
+        true
     }
 
     fn end_block(&self) -> Option<BlockNumber> {
@@ -218,6 +223,7 @@ impl<C: Blockchain> TriggersAdapter<C> for MockTriggersAdapter {
         &self,
         _ptr: BlockPtr,
         _offset: BlockNumber,
+        _root: Option<BlockHash>,
     ) -> Result<Option<C::Block>, Error> {
         todo!()
     }
@@ -227,7 +233,7 @@ impl<C: Blockchain> TriggersAdapter<C> for MockTriggersAdapter {
         _from: crate::components::store::BlockNumber,
         _to: crate::components::store::BlockNumber,
         _filter: &C::TriggerFilter,
-    ) -> Result<Vec<block_stream::BlockWithTriggers<C>>, Error> {
+    ) -> Result<(Vec<block_stream::BlockWithTriggers<C>>, BlockNumber), Error> {
         todo!()
     }
 
@@ -371,15 +377,17 @@ impl Blockchain for MockBlockchain {
         todo!()
     }
 
-    fn runtime(&self) -> (std::sync::Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook) {
-        todo!()
+    fn runtime(
+        &self,
+    ) -> anyhow::Result<(std::sync::Arc<dyn RuntimeAdapter<Self>>, Self::DecoderHook)> {
+        bail!("mock has no runtime adapter")
     }
 
     fn chain_client(&self) -> Arc<ChainClient<MockBlockchain>> {
         todo!()
     }
 
-    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
+    async fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
         todo!()
     }
 }

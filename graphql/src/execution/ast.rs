@@ -1,9 +1,8 @@
 use std::collections::{BTreeSet, HashSet};
 
 use graph::{
-    components::store::{AttributeNames, ChildMultiplicity},
-    constraint_violation,
-    data::graphql::ObjectOrInterface,
+    components::store::{AttributeNames, ChildMultiplicity, EntityOrder},
+    data::{graphql::ObjectOrInterface, store::ID},
     env::ENV_VARS,
     prelude::{anyhow, q, r, s, QueryExecutionError, ValueMap},
     schema::{ast::ObjectType, kw, AggregationInterval, ApiSchema, EntityType},
@@ -300,6 +299,7 @@ impl Field {
     pub fn selected_attrs(
         &self,
         entity_type: &EntityType,
+        order: &EntityOrder,
     ) -> Result<AttributeNames, QueryExecutionError> {
         if !ENV_VARS.enable_select_by_specific_attributes {
             return Ok(AttributeNames::All);
@@ -326,23 +326,20 @@ impl Field {
             })
             .collect();
 
-        // We need to also select the `orderBy` field if there is one.
-        // Because of how the API Schema is set up, `orderBy` can only have
-        // an enum value
-        match self.argument_value("orderBy") {
-            None => { /* nothing to do */ }
-            Some(r::Value::Enum(e)) => {
-                column_names.insert(e.clone());
+        // We need to also select the `orderBy` field if there is one
+        use EntityOrder::*;
+        let order_field = match order {
+            Ascending(name, _) | Descending(name, _) => Some(name.as_str()),
+            Default => Some(ID.as_str()),
+            ChildAscending(_) | ChildDescending(_) | Unordered => {
+                // No need to select anything for these
+                None
             }
-            Some(v) => {
-                return Err(constraint_violation!(
-                    "'orderBy' attribute must be an enum but is {:?}",
-                    v
-                )
-                .into());
-            }
+        };
+        if let Some(order_field) = order_field {
+            // We assume that `order` only contains valid field names
+            column_names.insert(order_field.to_string());
         }
-
         Ok(AttributeNames::Select(column_names))
     }
 

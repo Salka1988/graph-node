@@ -410,6 +410,11 @@ pub trait QueryStoreManager: Send + Sync + 'static {
 pub trait BlockStore: Send + Sync + 'static {
     type ChainStore: ChainStore;
 
+    fn create_chain_store(
+        &self,
+        network: &str,
+        ident: ChainIdentifier,
+    ) -> anyhow::Result<Arc<Self::ChainStore>>;
     fn chain_store(&self, network: &str) -> Option<Arc<Self::ChainStore>>;
 }
 
@@ -474,15 +479,25 @@ pub trait ChainStore: Send + Sync + 'static {
     ) -> Result<Vec<serde_json::Value>, Error>;
 
     /// Get the `offset`th ancestor of `block_hash`, where offset=0 means the block matching
-    /// `block_hash` and offset=1 means its parent. Returns None if unable to complete due to
-    /// missing blocks in the chain store.
+    /// `block_hash` and offset=1 means its parent. If `root` is passed, short-circuit upon finding
+    /// a child of `root`. Returns None if unable to complete due to missing blocks in the chain
+    /// store.
+    ///
+    /// The short-circuit mechanism is particularly useful in situations where blocks are skipped
+    /// in certain chains like Filecoin EVM. In such cases, relying solely on the numeric offset
+    /// might lead to inaccuracies because block numbers could be non-sequential. By allowing a
+    /// `root` block hash as a reference, the function can more accurately identify the desired
+    /// ancestor by stopping the search as soon as it discovers a block that is a direct child
+    /// of the `root` (i.e., when block.parent_hash equals root.hash). This approach ensures
+    /// the correct ancestor block is identified without solely depending on the offset.
     ///
     /// Returns an error if the offset would reach past the genesis block.
     async fn ancestor_block(
         self: Arc<Self>,
         block_ptr: BlockPtr,
         offset: BlockNumber,
-    ) -> Result<Option<serde_json::Value>, Error>;
+        root: Option<BlockHash>,
+    ) -> Result<Option<(serde_json::Value, BlockPtr)>, Error>;
 
     /// Remove old blocks from the cache we maintain in the database and
     /// return a pair containing the number of the oldest block retained
@@ -526,7 +541,10 @@ pub trait ChainStore: Send + Sync + 'static {
     async fn clear_call_cache(&self, from: BlockNumber, to: BlockNumber) -> Result<(), Error>;
 
     /// Return the chain identifier for this store.
-    fn chain_identifier(&self) -> &ChainIdentifier;
+    fn chain_identifier(&self) -> Result<ChainIdentifier, Error>;
+
+    /// Update the chain identifier for this store.
+    fn set_chain_identifier(&self, ident: &ChainIdentifier) -> Result<(), Error>;
 }
 
 pub trait EthereumCallCache: Send + Sync + 'static {

@@ -11,7 +11,7 @@ use diesel::query_dsl::RunQueryDsl;
 use diesel::result::{Error as DieselError, QueryResult};
 use diesel::sql_types::Untyped;
 use diesel::sql_types::{Array, BigInt, Binary, Bool, Int8, Integer, Jsonb, Text, Timestamptz};
-use graph::components::store::write::{EntityWrite, WriteChunk};
+use graph::components::store::write::{EntityWrite, RowGroup, WriteChunk};
 use graph::components::store::{Child as StoreChild, DerivedEntityQuery};
 use graph::data::store::{Id, IdType, NULL};
 use graph::data::store::{IdList, IdRef, QueryObject};
@@ -109,9 +109,6 @@ macro_rules! constraint_violation {
 /// trait on a given column means "send these values to the database in a form
 /// that can later be used for comparisons with that column"
 trait ForeignKeyClauses {
-    /// The type of the column
-    fn column_type(&self) -> &ColumnType;
-
     /// The name of the column
     fn name(&self) -> &str;
 
@@ -167,10 +164,6 @@ impl PushBindParam for IdList {
 }
 
 impl ForeignKeyClauses for Column {
-    fn column_type(&self) -> &ColumnType {
-        &self.column_type
-    }
-
     fn name(&self) -> &str {
         self.name.as_str()
     }
@@ -2456,37 +2449,33 @@ impl<'a> QueryId for InsertQuery<'a> {
 impl<'a, Conn> RunQueryDsl<Conn> for InsertQuery<'a> {}
 
 #[derive(Debug, Clone)]
-pub struct ConflictingEntityQuery<'a> {
-    _layout: &'a Layout,
+pub struct ConflictingEntitiesQuery<'a> {
     tables: Vec<&'a Table>,
-    entity_id: &'a Id,
+    ids: IdList,
 }
-impl<'a> ConflictingEntityQuery<'a> {
+impl<'a> ConflictingEntitiesQuery<'a> {
     pub fn new(
         layout: &'a Layout,
-        entities: Vec<EntityType>,
-        entity_id: &'a Id,
+        entities: &[EntityType],
+        group: &'a RowGroup,
     ) -> Result<Self, StoreError> {
         let tables = entities
             .iter()
             .map(|entity| layout.table_for_entity(entity).map(|table| table.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ConflictingEntityQuery {
-            _layout: layout,
-            tables,
-            entity_id,
-        })
+        let ids = IdList::try_from_iter_ref(group.ids().map(|id| IdRef::from(id)))?;
+        Ok(ConflictingEntitiesQuery { tables, ids })
     }
 }
 
-impl<'a> QueryFragment<Pg> for ConflictingEntityQuery<'a> {
+impl<'a> QueryFragment<Pg> for ConflictingEntitiesQuery<'a> {
     fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         out.unsafe_to_cache_prepared();
 
         // Construct a query
-        //   select 'Type1' as entity from schema.table1 where id = $1
+        //   select 'Type1' as entity, id from schema.table1 where id = any($1)
         //   union all
-        //   select 'Type2' as entity from schema.table2 where id = $1
+        //   select 'Type2' as entity, id from schema.table2 where id = any($1)
         //   union all
         //   ...
         for (i, table) in self.tables.iter().enumerate() {
@@ -2495,32 +2484,35 @@ impl<'a> QueryFragment<Pg> for ConflictingEntityQuery<'a> {
             }
             out.push_sql("select ");
             out.push_bind_param::<Text, _>(table.object.as_str())?;
-            out.push_sql(" as entity from ");
+            out.push_sql(" as entity, id::text from ");
             out.push_sql(table.qualified_name.as_str());
-            out.push_sql(" where id = ");
-            self.entity_id.push_bind_param(&mut out)?;
+            out.push_sql(" where id = any(");
+            self.ids.push_bind_param(&mut out)?;
+            out.push_sql(")");
         }
         Ok(())
     }
 }
 
-impl<'a> QueryId for ConflictingEntityQuery<'a> {
+impl<'a> QueryId for ConflictingEntitiesQuery<'a> {
     type QueryId = ();
 
     const HAS_STATIC_QUERY_ID: bool = false;
 }
 
 #[derive(QueryableByName)]
-pub struct ConflictingEntityData {
+pub struct ConflictingEntitiesData {
     #[diesel(sql_type = Text)]
     pub entity: String,
+    #[diesel(sql_type = Text)]
+    pub id: String,
 }
 
-impl<'a> Query for ConflictingEntityQuery<'a> {
+impl<'a> Query for ConflictingEntitiesQuery<'a> {
     type SqlType = Untyped;
 }
 
-impl<'a, Conn> RunQueryDsl<Conn> for ConflictingEntityQuery<'a> {}
+impl<'a, Conn> RunQueryDsl<Conn> for ConflictingEntitiesQuery<'a> {}
 
 #[derive(Debug, Clone)]
 enum ParentIds {
@@ -3205,8 +3197,6 @@ impl<'a> FilterCollection<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ChildKeyDetails<'a> {
-    /// Table representing the parent entity
-    pub parent_table: &'a Table,
     /// Column in the parent table that stores the connection between the parent and the child
     pub parent_join_column: &'a Column,
     /// Table representing the child entity
@@ -3239,6 +3229,7 @@ pub struct ChildKeyAndIdSharedDetails<'a> {
     pub direction: &'static str,
 }
 
+#[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct ChildIdDetails<'a> {
     /// Table representing the parent entity
@@ -3533,7 +3524,6 @@ impl<'a> SortKey<'a> {
                 }
 
                 Ok(SortKey::ChildKey(ChildKey::Single(ChildKeyDetails {
-                    parent_table,
                     child_table,
                     parent_join_column: parent_column,
                     child_join_column: child_column,
@@ -3667,7 +3657,6 @@ impl<'a> SortKey<'a> {
                         build_children_vec(layout, parent_table, entity_types, child, direction)?
                             .iter()
                             .map(|details| ChildKeyDetails {
-                                parent_table: details.parent_table,
                                 parent_join_column: details.parent_join_column,
                                 child_table: details.child_table,
                                 child_join_column: details.child_join_column,
@@ -4443,7 +4432,7 @@ impl<'a> FilterQuery<'a> {
     ///
     /// Generate a query
     ///   select '..' as entity, to_jsonb(e.*) as data
-    ///     from (select c.*, p.id as g$parent_id from {window.children(...)}) c
+    ///     from (select {column_names}, p.id as g$parent_id from {window.children(...)}) c
     ///     order by c.g$parent_id, {sort_key}
     ///     limit {first} offset {skip}
     fn query_window_one_entity<'b>(
@@ -4452,8 +4441,9 @@ impl<'a> FilterQuery<'a> {
         mut out: AstPass<'_, 'b, Pg>,
     ) -> QueryResult<()> {
         Self::select_entity_and_data(window.table, &mut out);
-        out.push_sql(" from (\n");
-        out.push_sql("select c.*, p.id::text as ");
+        out.push_sql(" from (select ");
+        write_column_names(&window.column_names, window.table, Some("c."), &mut out)?;
+        out.push_sql(", p.id::text as ");
         out.push_sql(&*PARENT_ID);
         window.children(false, &self.limit, &mut out)?;
         out.push_sql(") c");

@@ -14,7 +14,7 @@ use crate::relational::{
     VID_COLUMN,
 };
 
-use super::{Catalog, Column, Layout, SqlName, Table};
+use super::{index::IndexList, Catalog, Column, Layout, SqlName, Table};
 
 // In debug builds (for testing etc.) unconditionally create exclusion constraints, in release
 // builds for production, skip them
@@ -29,7 +29,7 @@ impl Layout {
     ///
     /// See the unit tests at the end of this file for the actual DDL that
     /// gets generated
-    pub fn as_ddl(&self) -> Result<String, fmt::Error> {
+    pub fn as_ddl(&self, index_def: Option<IndexList>) -> Result<String, fmt::Error> {
         let mut out = String::new();
 
         // Output enums first so table definitions can reference them
@@ -41,7 +41,12 @@ impl Layout {
         tables.sort_by_key(|table| table.position);
         // Output 'create table' statements for all tables
         for table in tables {
-            table.as_ddl(&self.input_schema, &self.catalog, &mut out)?;
+            table.as_ddl(
+                &self.input_schema,
+                &self.catalog,
+                index_def.as_ref(),
+                &mut out,
+            )?;
         }
 
         Ok(out)
@@ -212,7 +217,7 @@ impl Table {
     /// A tuple `(String, String)` where:
     /// - The first element is the indexing method ("btree", "gist", or "gin"),
     /// - The second element is the index expression as a string.
-    pub fn calculate_index_method_and_expression(
+    fn calculate_attr_index_method_and_expression(
         immutable: bool,
         column: &Column,
     ) -> (String, String) {
@@ -225,36 +230,89 @@ impl Table {
                 ("gist".to_string(), index_expr)
             }
         } else {
-            let index_expr = if column.use_prefix_comparison {
-                match column.column_type {
-                    ColumnType::String => {
-                        format!("left({}, {})", column.name.quoted(), STRING_PREFIX_SIZE)
-                    }
-                    ColumnType::Bytes => format!(
-                        "substring({}, 1, {})",
-                        column.name.quoted(),
-                        BYTE_ARRAY_PREFIX_SIZE
-                    ),
-                    // Handle other types if necessary, or maintain the unreachable statement
-                    _ => unreachable!("only String and Bytes can have arbitrary size"),
-                }
-            } else {
-                column.name.quoted()
-            };
-
-            let method = if column.is_list() || column.is_fulltext() {
-                "gin".to_string()
-            } else {
-                "btree".to_string()
-            };
-
-            (method, index_expr)
+            Self::calculate_index_method_and_expression(column)
         }
     }
 
-    fn create_attribute_indexes(&self, out: &mut String) -> fmt::Result {
-        // Create indexes.
+    pub fn calculate_index_method_and_expression(column: &Column) -> (String, String) {
+        let index_expr = if column.use_prefix_comparison {
+            match column.column_type {
+                ColumnType::String => {
+                    format!("left({}, {})", column.name.quoted(), STRING_PREFIX_SIZE)
+                }
+                ColumnType::Bytes => format!(
+                    "substring({}, 1, {})",
+                    column.name.quoted(),
+                    BYTE_ARRAY_PREFIX_SIZE
+                ),
+                // Handle other types if necessary, or maintain the unreachable statement
+                _ => unreachable!("only String and Bytes can have arbitrary size"),
+            }
+        } else {
+            column.name.quoted()
+        };
 
+        let method = if column.is_list() || column.is_fulltext() {
+            "gin".to_string()
+        } else {
+            "btree".to_string()
+        };
+
+        (method, index_expr)
+    }
+
+    pub(crate) fn create_postponed_indexes(&self, skip_colums: Vec<String>) -> Vec<String> {
+        let mut indexing_queries = vec![];
+        let columns = self.columns_to_index();
+
+        for (column_index, column) in columns.enumerate() {
+            let (method, index_expr) =
+                Self::calculate_attr_index_method_and_expression(self.immutable, column);
+            if !column.is_list()
+                && method == "btree"
+                && column.name.as_str() != "id"
+                && !skip_colums.contains(&column.name.to_string())
+            {
+                let sql = format!(
+                    "create index concurrently if not exists attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {qname} using {method}({index_expr});\n",
+                    table_index = self.position,
+                    table_name = self.name,
+                    column_name = column.name,
+                    qname = self.qualified_name,
+                );
+                indexing_queries.push(sql);
+            }
+        }
+        indexing_queries
+    }
+
+    fn create_attribute_indexes(&self, out: &mut String) -> fmt::Result {
+        let columns = self.columns_to_index();
+
+        for (column_index, column) in columns.enumerate() {
+            let (method, index_expr) =
+                Self::calculate_attr_index_method_and_expression(self.immutable, column);
+
+            // If `create_gin_indexes` is set to false, we don't create
+            // indexes on array attributes. Experience has shown that these
+            // indexes are very expensive to update and can have a very bad
+            // impact on the write performance of the database, but are
+            // hardly ever used or needed by queries.
+            if !column.is_list() || ENV_VARS.store.create_gin_indexes {
+                write!(
+                    out,
+                    "create index attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {qname} using {method}({index_expr});\n",
+                    table_index = self.position,
+                    table_name = self.name,
+                    column_name = column.name,
+                    qname = self.qualified_name,
+                )?;
+            }
+        }
+        writeln!(out)
+    }
+
+    fn columns_to_index(&self) -> impl Iterator<Item = &Column> {
         // Skip columns whose type is an array of enum, since there is no
         // good way to index them with Postgres 9.6. Once we move to
         // Postgres 11, we can enable that (tracked in graph-node issue
@@ -278,27 +336,7 @@ impl Table {
             .filter(not_enum_list)
             .filter(not_immutable_pk)
             .filter(not_numeric_list);
-
-        for (column_index, column) in columns.enumerate() {
-            let (method, index_expr) =
-                Self::calculate_index_method_and_expression(self.immutable, column);
-            // If `create_gin_indexes` is set to false, we don't create
-            // indexes on array attributes. Experience has shown that these
-            // indexes are very expensive to update and can have a very bad
-            // impact on the write performance of the database, but are
-            // hardly ever used or needed by queries.
-            if !column.is_list() || ENV_VARS.store.create_gin_indexes {
-                write!(
-                    out,
-                    "create index attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {qname} using {method}({index_expr});\n",
-                    table_index = self.position,
-                    table_name = self.name,
-                    column_name = column.name,
-                    qname = self.qualified_name,
-                )?;
-            }
-        }
-        writeln!(out)
+        columns
     }
 
     /// If `self` is an aggregation and has cumulative aggregates, create an
@@ -349,11 +387,28 @@ impl Table {
         &self,
         schema: &InputSchema,
         catalog: &Catalog,
+        index_def: Option<&IndexList>,
         out: &mut String,
     ) -> fmt::Result {
         self.create_table(out)?;
         self.create_time_travel_indexes(catalog, out)?;
-        self.create_attribute_indexes(out)?;
+        if index_def.is_some() && ENV_VARS.postpone_attribute_index_creation {
+            let arr = index_def
+                .unwrap()
+                .indexes_for_table(
+                    &catalog.site.namespace,
+                    &self.name.to_string(),
+                    &self,
+                    false,
+                    false,
+                )
+                .map_err(|_| fmt::Error)?;
+            for (_, sql) in arr {
+                writeln!(out, "{};", sql).expect("properly formated index statements")
+            }
+        } else {
+            self.create_attribute_indexes(out)?;
+        }
         self.create_aggregate_indexes(schema, out)
     }
 

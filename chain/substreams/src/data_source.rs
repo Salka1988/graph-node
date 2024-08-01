@@ -99,7 +99,7 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn is_duplicate_of(&self, _other: &Self) -> bool {
-        todo!()
+        self == _other
     }
 
     fn as_stored_dynamic_data_source(&self) -> graph::components::store::StoredDynamicDataSource {
@@ -530,6 +530,7 @@ mod test {
                         kind: Some(Kind::KindMap(KindMap {
                             output_type: "proto".into(),
                         })),
+                        block_filter: None,
                         inputs: vec![],
                         output: None,
                     },
@@ -542,6 +543,7 @@ mod test {
                             update_policy: 1,
                             value_type: "proto1".into(),
                         })),
+                        block_filter: None,
                         inputs: vec![],
                         output: None,
                     },
@@ -553,6 +555,7 @@ mod test {
                         kind: Some(Kind::KindMap(KindMap {
                             output_type: "proto2".into(),
                         })),
+                        block_filter: None,
                         inputs: vec![],
                         output: None,
                     },

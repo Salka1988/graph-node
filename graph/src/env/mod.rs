@@ -70,8 +70,7 @@ pub struct EnvVars {
     /// assertions](https://doc.rust-lang.org/reference/conditional-compilation.html#debug_assertions)
     /// are enabled.
     pub allow_non_deterministic_fulltext_search: bool,
-    /// Set by the environment variable `GRAPH_MAX_SPEC_VERSION`. The default
-    /// value is `0.0.7`.
+    /// Set by the environment variable `GRAPH_MAX_SPEC_VERSION`.
     pub max_spec_version: Version,
     /// Set by the environment variable `GRAPH_LOAD_WINDOW_SIZE` (expressed in
     /// seconds). The default value is 300 seconds.
@@ -150,9 +149,13 @@ pub struct EnvVars {
     pub subgraph_error_retry_jitter: f64,
     /// Experimental feature.
     ///
-    /// Set by the flag `GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES`. Off by
+    /// Set by the flag `GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES`. On by
     /// default.
     pub enable_select_by_specific_attributes: bool,
+    /// Experimental feature.
+    ///
+    /// Set the flag `GRAPH_POSTPONE_ATTRIBUTE_INDEX_CREATION`. Off by default.
+    pub postpone_attribute_index_creation: bool,
     /// Verbose logging of mapping inputs.
     ///
     /// Set by the flag `GRAPH_LOG_TRIGGER_DATA`. Off by
@@ -199,10 +202,25 @@ pub struct EnvVars {
     /// The amount of history to keep when using 'min' historyBlocks
     /// in the manifest
     pub min_history_blocks: BlockNumber,
-
     /// Set by the env var `dips_metrics_object_store_url`
     /// The name of the object store bucket to store DIPS metrics
     pub dips_metrics_object_store_url: Option<String>,
+    /// Write a list of how sections are nested to the file `section_map`
+    /// which must be an absolute path. This only has an effect in debug
+    /// builds. Set with `GRAPH_SECTION_MAP`. Defaults to `None`.
+    pub section_map: Option<String>,
+    /// Set the maximum grpc decode size(in MB) for firehose BlockIngestor connections.
+    /// Defaults to 25MB
+    pub firehose_grpc_max_decode_size_mb: usize,
+    /// Defined whether or not graph-node should refuse to perform genesis validation
+    /// before using an adapter. Disabled by default for the moment, will be enabled
+    /// on the next release. Disabling validation means the recorded genesis will be 0x00
+    /// if no genesis hash can be retrieved from an adapter. If enabled, the adapter is
+    /// ignored if unable to produce a genesis hash or produces a different an unexpected hash.
+    pub genesis_validation_enabled: bool,
+    /// How long do we wait for a response from the provider before considering that it is unavailable.
+    /// Default is 30s.
+    pub genesis_validation_timeout: Duration,
 }
 
 impl EnvVars {
@@ -211,6 +229,16 @@ impl EnvVars {
         let graphql = InnerGraphQl::init_from_env()?.into();
         let mapping_handlers = InnerMappingHandlers::init_from_env()?.into();
         let store = InnerStore::init_from_env()?.into();
+
+        // The default reorganization (reorg) threshold is set to 250.
+        // For testing purposes, we need to set this threshold to 0 because:
+        // 1. Many tests involve reverting blocks.
+        // 2. Blocks cannot be reverted below the reorg threshold.
+        // Therefore, during tests, we want to set the reorg threshold to 0.
+        let reorg_threshold =
+            inner
+                .reorg_threshold
+                .unwrap_or_else(|| if cfg!(debug_assertions) { 0 } else { 250 });
 
         Ok(Self {
             graphql,
@@ -256,6 +284,8 @@ impl EnvVars {
             subgraph_error_retry_ceil: Duration::from_secs(inner.subgraph_error_retry_ceil_in_secs),
             subgraph_error_retry_jitter: inner.subgraph_error_retry_jitter,
             enable_select_by_specific_attributes: inner.enable_select_by_specific_attributes.0,
+            postpone_attribute_index_creation: inner.postpone_attribute_index_creation.0
+                || cfg!(debug_assertions),
             log_trigger_data: inner.log_trigger_data.0,
             explorer_ttl: Duration::from_secs(inner.explorer_ttl_in_secs),
             explorer_lock_threshold: Duration::from_millis(inner.explorer_lock_threshold_in_msec),
@@ -263,16 +293,18 @@ impl EnvVars {
             external_http_base_url: inner.external_http_base_url,
             external_ws_base_url: inner.external_ws_base_url,
             static_filters_threshold: inner.static_filters_threshold,
-            reorg_threshold: inner.reorg_threshold,
+            reorg_threshold,
             ingestor_polling_interval: Duration::from_millis(inner.ingestor_polling_interval),
             subgraph_settings: inner.subgraph_settings,
             prefer_substreams_block_streams: inner.prefer_substreams_block_streams,
             enable_dips_metrics: inner.enable_dips_metrics.0,
             history_blocks_override: inner.history_blocks_override,
-            min_history_blocks: inner
-                .min_history_blocks
-                .unwrap_or(2 * inner.reorg_threshold),
+            min_history_blocks: inner.min_history_blocks.unwrap_or(2 * reorg_threshold),
             dips_metrics_object_store_url: inner.dips_metrics_object_store_url,
+            section_map: inner.section_map,
+            firehose_grpc_max_decode_size_mb: inner.firehose_grpc_max_decode_size_mb,
+            genesis_validation_enabled: inner.genesis_validation_enabled.0,
+            genesis_validation_timeout: Duration::from_secs(inner.genesis_validation_timeout),
         })
     }
 
@@ -325,7 +357,7 @@ struct Inner {
         default = "false"
     )]
     allow_non_deterministic_fulltext_search: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.0.0")]
+    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "1.2.0")]
     max_spec_version: Version,
     #[envconfig(from = "GRAPH_LOAD_WINDOW_SIZE", default = "300")]
     load_window_size_in_secs: u64,
@@ -376,8 +408,10 @@ struct Inner {
     subgraph_error_retry_ceil_in_secs: u64,
     #[envconfig(from = "GRAPH_SUBGRAPH_ERROR_RETRY_JITTER", default = "0.2")]
     subgraph_error_retry_jitter: f64,
-    #[envconfig(from = "GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES", default = "false")]
+    #[envconfig(from = "GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES", default = "true")]
     enable_select_by_specific_attributes: EnvVarBoolean,
+    #[envconfig(from = "GRAPH_POSTPONE_ATTRIBUTE_INDEX_CREATION", default = "false")]
+    postpone_attribute_index_creation: EnvVarBoolean,
     #[envconfig(from = "GRAPH_LOG_TRIGGER_DATA", default = "false")]
     log_trigger_data: EnvVarBoolean,
     #[envconfig(from = "GRAPH_EXPLORER_TTL", default = "10")]
@@ -393,8 +427,8 @@ struct Inner {
     #[envconfig(from = "GRAPH_STATIC_FILTERS_THRESHOLD", default = "10000")]
     static_filters_threshold: usize,
     // JSON-RPC specific.
-    #[envconfig(from = "ETHEREUM_REORG_THRESHOLD", default = "250")]
-    reorg_threshold: BlockNumber,
+    #[envconfig(from = "ETHEREUM_REORG_THRESHOLD")]
+    reorg_threshold: Option<BlockNumber>,
     #[envconfig(from = "ETHEREUM_POLLING_INTERVAL", default = "1000")]
     ingestor_polling_interval: u64,
     #[envconfig(from = "GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS")]
@@ -412,6 +446,14 @@ struct Inner {
     min_history_blocks: Option<BlockNumber>,
     #[envconfig(from = "GRAPH_DIPS_METRICS_OBJECT_STORE_URL")]
     dips_metrics_object_store_url: Option<String>,
+    #[envconfig(from = "GRAPH_SECTION_MAP")]
+    section_map: Option<String>,
+    #[envconfig(from = "GRAPH_NODE_FIREHOSE_MAX_DECODE_SIZE", default = "25")]
+    firehose_grpc_max_decode_size_mb: usize,
+    #[envconfig(from = "GRAPH_NODE_GENESIS_VALIDATION_ENABLED", default = "false")]
+    genesis_validation_enabled: EnvVarBoolean,
+    #[envconfig(from = "GRAPH_NODE_GENESIS_VALIDATION_TIMEOUT_SECONDS", default = "30")]
+    genesis_validation_timeout: u64,
 }
 
 #[derive(Clone, Debug)]

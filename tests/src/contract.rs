@@ -7,7 +7,7 @@ use graph::prelude::{
         api::{Eth, Namespace},
         contract::{tokens::Tokenize, Contract as Web3Contract, Options},
         transports::Http,
-        types::{Address, TransactionReceipt},
+        types::{Address, Bytes, TransactionReceipt},
     },
 };
 // web3 version 0.18 does not expose this; once the graph crate updates to
@@ -60,9 +60,13 @@ impl Contract {
     }
 
     async fn exists(&self) -> bool {
-        let eth = Self::eth();
-        let bytes = eth.code(self.address, None).await.unwrap();
+        let bytes = self.code().await;
         !bytes.0.is_empty()
+    }
+
+    pub async fn code(&self) -> Bytes {
+        let eth = Self::eth();
+        eth.code(self.address, None).await.unwrap()
     }
 
     fn code_and_abi(name: &str) -> anyhow::Result<(String, Vec<u8>)> {
@@ -97,7 +101,11 @@ impl Contract {
         })
     }
 
-    async fn call(&self, func: &str, params: impl Tokenize) -> anyhow::Result<TransactionReceipt> {
+    pub async fn call(
+        &self,
+        func: &str,
+        params: impl Tokenize,
+    ) -> anyhow::Result<TransactionReceipt> {
         let eth = Self::eth();
         let (_, abi) = Self::code_and_abi(&self.name)?;
         let contract = Web3Contract::from_json(eth, self.address, &abi)?;

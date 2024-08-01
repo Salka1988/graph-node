@@ -1,6 +1,8 @@
 use diesel::{self, PgConnection};
 use graph::blockchain::mock::MockDataSource;
 use graph::blockchain::BlockTime;
+use graph::blockchain::ChainIdentifier;
+use graph::components::store::BlockStore;
 use graph::data::graphql::load_manager::LoadManager;
 use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
@@ -13,9 +15,9 @@ use graph::schema::EntityType;
 use graph::schema::InputSchema;
 use graph::semver::Version;
 use graph::{
-    blockchain::block_stream::FirehoseCursor, blockchain::ChainIdentifier,
-    components::store::DeploymentLocator, components::store::StatusStore,
-    components::store::StoredDynamicDataSource, data::subgraph::status, prelude::NodeId,
+    blockchain::block_stream::FirehoseCursor, components::store::DeploymentLocator,
+    components::store::StatusStore, components::store::StoredDynamicDataSource,
+    data::subgraph::status, prelude::NodeId,
 };
 use graph_graphql::prelude::{
     execute_query, Query as PreparedQuery, QueryExecutionOptions, StoreResolver,
@@ -350,7 +352,7 @@ pub async fn transact_entities_and_dynamic_data_sources(
     ops: Vec<EntityOperation>,
     manifest_idx_and_name: Vec<(u32, String)>,
 ) -> Result<(), StoreError> {
-    let store = futures03::executor::block_on(store.cheap_clone().writable(
+    let store = graph::futures03::executor::block_on(store.cheap_clone().writable(
         LOGGER.clone(),
         deployment.id,
         Arc::new(manifest_idx_and_name),
@@ -626,19 +628,30 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
                 genesis_block_hash: GENESIS_PTR.hash.clone(),
             };
 
-            (
-                builder.network_store(
-                    vec![
-                        (NETWORK_NAME.to_string(), ident.clone()),
-                        (FAKE_NETWORK_SHARED.to_string(), ident),
-                    ]
-                    .into_iter()
-                    .collect(),
-                ),
-                primary_pool,
-                config,
-                subscription_manager,
-            )
+            let store = builder.network_store(
+                vec![
+                    (NETWORK_NAME.to_string()),
+                    (FAKE_NETWORK_SHARED.to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            match store.block_store().chain_store(NETWORK_NAME) {
+                Some(cs) => {
+                    cs.set_chain_identifier(&ChainIdentifier {
+                        net_version: NETWORK_VERSION.to_string(),
+                        genesis_block_hash: GENESIS_PTR.hash.clone(),
+                    })
+                    .expect("unable to set identifier");
+                }
+                None => {
+                    store
+                        .block_store()
+                        .create_chain_store(NETWORK_NAME, ident)
+                        .expect("unable to create test network store");
+                }
+            }
+            (store, primary_pool, config, subscription_manager)
         })
     })
     .join()

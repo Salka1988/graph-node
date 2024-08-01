@@ -1,3 +1,4 @@
+use graph::futures03;
 use graph::{
     components::{
         server::index_node::VersionInfo,
@@ -13,11 +14,11 @@ use graph::{
     prelude::EntityChange,
     prelude::EntityChangeOperation,
     prelude::QueryStoreManager,
+    prelude::StoreEvent,
     prelude::SubgraphManifest,
     prelude::SubgraphName,
     prelude::SubgraphVersionSwitchingMode,
     prelude::UnfailOutcome,
-    prelude::{futures03, StoreEvent},
     prelude::{CheapClone, DeploymentHash, NodeId, SubgraphStore as _},
     schema::InputSchema,
     semver::Version,
@@ -31,6 +32,30 @@ const SUBGRAPH_GQL: &str = "
     type User @entity {
         id: ID!,
         name: String
+    }
+";
+
+const SUBGRAPH_FEATURES_GQL: &str = "
+    type User @entity {
+        id: ID!,
+        name: String
+    }
+
+    type User2 @entity(immutable: true) {
+        id: Bytes!,
+        name: String
+    }
+
+    type Data @entity(timeseries: true) {
+        id: Int8!
+        timestamp: Timestamp!
+        price: BigDecimal!
+    }
+
+    type Stats @aggregation(intervals: [\"hour\", \"day\"], source: \"Data\") {
+        id: Int8!
+        timestamp: Timestamp!
+        sum: BigDecimal! @aggregate(fn: \"sum\", arg: \"price\")
     }
 ";
 
@@ -501,7 +526,7 @@ fn subgraph_features() {
 
         remove_subgraphs();
         block_store::set_chain(vec![], NETWORK_NAME).await;
-        create_test_subgraph_with_features(&id, SUBGRAPH_GQL).await;
+        create_test_subgraph_with_features(&id, SUBGRAPH_FEATURES_GQL).await;
 
         let DeploymentFeatures {
             id: subgraph_id,
@@ -511,6 +536,10 @@ fn subgraph_features() {
             data_source_kinds,
             network,
             handler_kinds,
+            has_declared_calls,
+            has_bytes_as_ids,
+            immutable_entities,
+            has_aggregations,
         } = get_subgraph_features(id.to_string()).unwrap();
 
         assert_eq!(NAME, subgraph_id.as_str());
@@ -528,6 +557,13 @@ fn subgraph_features() {
         assert_eq!(handler_kinds.len(), 2);
         assert!(handler_kinds.contains(&"mock_handler_1".to_string()));
         assert!(handler_kinds.contains(&"mock_handler_2".to_string()));
+        assert_eq!(has_declared_calls, true);
+        assert_eq!(has_bytes_as_ids, true);
+        assert_eq!(has_aggregations, true);
+        assert_eq!(
+            immutable_entities,
+            vec!["User2".to_string(), "Data".to_string()]
+        );
 
         test_store::remove_subgraph(&id);
         let features = get_subgraph_features(id.to_string());

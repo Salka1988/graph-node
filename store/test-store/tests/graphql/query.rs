@@ -18,6 +18,7 @@ use test_store::block_store::{
     FakeBlock, BLOCK_FOUR, BLOCK_ONE, BLOCK_THREE, BLOCK_TWO, GENESIS_BLOCK,
 };
 
+use graph::futures03::stream::StreamExt;
 use graph::{
     components::store::DeploymentLocator,
     data::graphql::{object, object_value},
@@ -27,11 +28,10 @@ use graph::{
         subgraph::SubgraphFeature,
     },
     prelude::{
-        futures03::stream::StreamExt, lazy_static, o, q, r, serde_json, slog, BlockPtr,
-        DeploymentHash, Entity, EntityOperation, FutureExtension, GraphQlRunner as _, Logger,
-        NodeId, Query, QueryError, QueryExecutionError, QueryResult, QueryStoreManager,
-        QueryVariables, SubgraphManifest, SubgraphName, SubgraphStore,
-        SubgraphVersionSwitchingMode, Subscription, SubscriptionError,
+        lazy_static, o, q, r, serde_json, slog, BlockPtr, DeploymentHash, Entity, EntityOperation,
+        FutureExtension, GraphQlRunner as _, Logger, NodeId, Query, QueryError,
+        QueryExecutionError, QueryResult, QueryStoreManager, QueryVariables, SubgraphManifest,
+        SubgraphName, SubgraphStore, SubgraphVersionSwitchingMode, Subscription, SubscriptionError,
     },
 };
 use graph_graphql::{prelude::*, subscription::execute_subscription};
@@ -283,6 +283,7 @@ fn test_schema(id: DeploymentHash, id_type: IdType) -> InputSchema {
         reviews: [SongReview!]! @derivedFrom(field: \"song\")
         media: [Media!]!
         release: Release! @derivedFrom(field: \"songs\")
+        stats: [SongStat!]! @derivedFrom(field: \"id\")
     }
 
     type SongStat @entity {
@@ -2633,6 +2634,20 @@ fn can_query_meta() {
         "query { _meta(block: { number: 3 }) { deployment block { hash number } } }";
     run_query(QUERY4, |result, _| {
         assert!(result.has_errors());
+    });
+
+    // metadata for number_gte 1. Returns subgraph head and a valid hash
+    const QUERY5: &str = "query { _meta(block: { number_gte: 1 }) { block { hash number } } }";
+    run_query(QUERY5, |result, _| {
+        let exp = object! {
+            _meta: object! {
+                block: object! {
+                    hash: BLOCKS[2].hash.to_string(),
+                    number: 2
+                },
+            },
+        };
+        assert_eq!(extract_data!(result), Some(exp));
     });
 }
 

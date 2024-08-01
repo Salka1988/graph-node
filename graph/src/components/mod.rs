@@ -33,7 +33,7 @@
 //! that define common operations on event streams, facilitating the
 //! configuration of component graphs.
 
-use futures::prelude::*;
+use futures01::{Sink, Stream};
 
 /// Components dealing with subgraphs.
 pub mod subgraph;
@@ -59,6 +59,8 @@ pub mod metrics;
 
 /// Components dealing with versioning
 pub mod versions;
+
+pub mod adapter;
 
 /// A component that receives events of type `T`.
 pub trait EventConsumer<E> {

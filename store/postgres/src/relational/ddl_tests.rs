@@ -1,9 +1,10 @@
+use index::CreateIndex;
 use itertools::Itertools;
 use pretty_assertions::assert_eq;
 
 use super::*;
 
-use crate::layout_for_tests::make_dummy_site;
+use crate::{deployment_store::generate_index_creation_sql, layout_for_tests::make_dummy_site};
 
 const ID_TYPE: ColumnType = ColumnType::String;
 
@@ -58,33 +59,192 @@ fn check_eqv(left: &str, right: &str) {
 }
 
 #[test]
+fn test_manual_index_creation_ddl() {
+    let layout = Arc::new(test_layout(BOOKS_GQL));
+
+    #[track_caller]
+    fn assert_generated_sql(
+        layout: Arc<Layout>,
+        entity_name: &str,
+        field_names: Vec<String>,
+        index_method: &str,
+        expected_format: &str,
+        after: Option<BlockNumber>,
+    ) {
+        let namespace = layout.site.namespace.clone();
+        let expected = expected_format.replace("{namespace}", namespace.as_str());
+
+        let (_, sql): (String, String) = generate_index_creation_sql(
+            layout.clone(),
+            entity_name,
+            field_names,
+            index::Method::from_str(index_method).unwrap(),
+            after,
+        )
+        .unwrap();
+
+        check_eqv(&expected, sql.trim());
+    }
+
+    const BTREE: &str = "btree"; // Assuming index::Method is the enum containing the BTree variant
+    const GIST: &str = "gist";
+
+    assert_generated_sql(
+        layout.clone(),
+        "Book",
+        vec!["id".to_string()],
+        BTREE,
+        "create index concurrently if not exists manual_book_id on {namespace}.book using btree (\"id\")",
+        None
+    );
+
+    assert_generated_sql(
+        layout.clone(),
+        "Book",
+        vec!["content".to_string()],
+        BTREE,
+        "create index concurrently if not exists manual_book_content on {namespace}.book using btree (substring(\"content\", 1, 64))",
+        None
+    );
+
+    assert_generated_sql(
+        layout.clone(),
+        "Book",
+        vec!["title".to_string()],
+        BTREE,
+        "create index concurrently if not exists manual_book_title on {namespace}.book using btree (left(\"title\", 256))",
+        None
+    );
+
+    assert_generated_sql(
+        layout.clone(),
+        "Book",
+        vec!["page_count".to_string()],
+        BTREE,
+        "create index concurrently if not exists manual_book_page_count on {namespace}.book using btree (\"page_count\")",
+        None
+    );
+
+    assert_generated_sql(
+        layout.clone(),
+        "Book",
+        vec!["page_count".to_string(), "title".to_string()],
+        BTREE,
+        "create index concurrently if not exists manual_book_page_count_title on {namespace}.book using btree (\"page_count\", left(\"title\", 256))",
+        None
+    );
+
+    assert_generated_sql(
+        layout.clone(),
+        "Book",
+        vec!["content".to_string(), "block_range".to_string()], // Explicitly including 'block_range'
+        GIST,
+        "create index concurrently if not exists manual_book_content_block_range on {namespace}.book using gist (substring(\"content\", 1, 64), block_range)",
+        None
+    );
+
+    assert_generated_sql(
+        layout.clone(),
+        "Book",
+        vec!["page_count".to_string()],
+        BTREE,
+        "create index concurrently if not exists manual_book_page_count_12345 on sgd0815.book using btree (\"page_count\")  where coalesce(upper(block_range), 2147483647) > 12345",
+        Some(12345)
+    );
+}
+
+#[test]
+fn generate_postponed_indexes() {
+    let layout = test_layout(THING_GQL);
+    let table = layout.table(&SqlName::from("Scalar")).unwrap();
+    let skip_colums = vec!["id".to_string()];
+    let query_vec = table.create_postponed_indexes(skip_colums);
+    assert!(query_vec.len() == 7);
+    let queries = query_vec.join(" ");
+    check_eqv(THING_POSTPONED_INDEXES, &queries)
+}
+const THING_POSTPONED_INDEXES: &str = r#"
+create index concurrently if not exists attr_1_1_scalar_bool
+    on "sgd0815"."scalar" using btree("bool");
+ create index concurrently if not exists attr_1_2_scalar_int
+    on "sgd0815"."scalar" using btree("int");
+ create index concurrently if not exists attr_1_3_scalar_big_decimal
+    on "sgd0815"."scalar" using btree("big_decimal");
+ create index concurrently if not exists attr_1_4_scalar_string
+    on "sgd0815"."scalar" using btree(left("string", 256));
+ create index concurrently if not exists attr_1_5_scalar_bytes
+    on "sgd0815"."scalar" using btree(substring("bytes", 1, 64));
+ create index concurrently if not exists attr_1_6_scalar_big_int
+    on "sgd0815"."scalar" using btree("big_int");
+ create index concurrently if not exists attr_1_7_scalar_color
+    on "sgd0815"."scalar" using btree("color");
+"#;
+
+impl IndexList {
+    fn mock_thing_index_list() -> Self {
+        let mut indexes: HashMap<String, Vec<CreateIndex>> = HashMap::new();
+        let v1 = vec![
+            CreateIndex::parse(r#"create index thing_id_block_range_excl on sgd0815.thing using gist (id, block_range)"#.to_string()),
+            CreateIndex::parse(r#"create index brin_thing on sgd0815."thing" using brin (lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops)"#.to_string()),
+            // fixme: enable the index bellow once the parsing of statements is fixed, and BlockRangeUpper in particular (issue #5512)
+            // CreateIndex::parse(r#"create index thing_block_range_closed on sgd0815."thing" using btree (coalesce(upper(block_range), 2147483647)) where coalesce((upper(block_range), 2147483647) < 2147483647)"#.to_string()),
+            CreateIndex::parse(r#"create index attr_0_0_thing_id on sgd0815."thing" using btree (id)"#.to_string()),
+            CreateIndex::parse(r#"create index attr_0_1_thing_big_thing on sgd0815."thing" using gist (big_thing, block_range)"#.to_string()),
+        ];
+        indexes.insert("thing".to_string(), v1);
+        let v2 = vec![
+            CreateIndex::parse(r#"create index attr_1_0_scalar_id on sgd0815."scalar" using btree (id)"#.to_string(),),
+            CreateIndex::parse(r#"create index attr_1_1_scalar_bool on sgd0815."scalar" using btree (bool)"#.to_string(),),
+            CreateIndex::parse(r#"create index attr_1_2_scalar_int on sgd0815."scalar" using btree (int)"#.to_string(),),
+            CreateIndex::parse(r#"create index attr_1_3_scalar_big_decimal on sgd0815."scalar" using btree (big_decimal)"#.to_string()),
+            CreateIndex::parse(r#"create index attr_1_4_scalar_string on sgd0815."scalar" using btree (left(string, 256))"#.to_string()),
+            CreateIndex::parse(r#"create index attr_1_5_scalar_bytes on sgd0815."scalar" using btree (substring(bytes, 1, 64))"#.to_string()),
+            CreateIndex::parse(r#"create index attr_1_6_scalar_big_int on sgd0815."scalar" using btree (big_int)"#.to_string()),
+            CreateIndex::parse(r#"create index attr_1_7_scalar_color on sgd0815."scalar" using btree (color)"#.to_string()),
+        ];
+        indexes.insert("scalar".to_string(), v2);
+        let v3 = vec![CreateIndex::parse(
+            r#"create index attr_2_0_file_thing_id on sgd0815."file_thing" using btree (id)"#
+                .to_string(),
+        )];
+        indexes.insert("file_thing".to_string(), v3);
+        IndexList { indexes }
+    }
+}
+
+#[test]
 fn generate_ddl() {
     let layout = test_layout(THING_GQL);
-    let sql = layout.as_ddl().expect("Failed to generate DDL");
+    let sql = layout.as_ddl(None).expect("Failed to generate DDL");
     assert_eq!(THING_DDL, &sql); // Use `assert_eq!` to also test the formatting.
 
+    let il = IndexList::mock_thing_index_list();
+    let layout = test_layout(THING_GQL);
+    let sql = layout.as_ddl(Some(il)).expect("Failed to generate DDL");
+    check_eqv(THING_DDL_ON_COPY, &sql);
+
     let layout = test_layout(MUSIC_GQL);
-    let sql = layout.as_ddl().expect("Failed to generate DDL");
+    let sql = layout.as_ddl(None).expect("Failed to generate DDL");
     check_eqv(MUSIC_DDL, &sql);
 
     let layout = test_layout(FOREST_GQL);
-    let sql = layout.as_ddl().expect("Failed to generate DDL");
+    let sql = layout.as_ddl(None).expect("Failed to generate DDL");
     check_eqv(FOREST_DDL, &sql);
 
     let layout = test_layout(FULLTEXT_GQL);
-    let sql = layout.as_ddl().expect("Failed to generate DDL");
+    let sql = layout.as_ddl(None).expect("Failed to generate DDL");
     check_eqv(FULLTEXT_DDL, &sql);
 
     let layout = test_layout(FORWARD_ENUM_GQL);
-    let sql = layout.as_ddl().expect("Failed to generate DDL");
+    let sql = layout.as_ddl(None).expect("Failed to generate DDL");
     check_eqv(FORWARD_ENUM_SQL, &sql);
 
     let layout = test_layout(TS_GQL);
-    let sql = layout.as_ddl().expect("Failed to generate DDL");
+    let sql = layout.as_ddl(None).expect("Failed to generate DDL");
     check_eqv(TS_SQL, &sql);
 
     let layout = test_layout(LIFETIME_GQL);
-    let sql = layout.as_ddl().expect("Failed to generate DDL");
+    let sql = layout.as_ddl(None).expect("Failed to generate DDL");
     check_eqv(LIFETIME_SQL, &sql);
 }
 
@@ -302,6 +462,90 @@ create index attr_2_0_file_thing_id
     on "sgd0815"."file_thing" using btree("id");
 
 "#;
+
+const THING_DDL_ON_COPY: &str = r#"create type sgd0815."color"
+    as enum ('BLUE', 'red', 'yellow');
+create type sgd0815."size"
+    as enum ('large', 'medium', 'small');
+
+    create table "sgd0815"."thing" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
+        "id"                 text not null,
+        "big_thing"          text not null
+    );
+
+    alter table "sgd0815"."thing"
+        add constraint thing_id_block_range_excl exclude using gist (id with =, block_range with &&);
+create index brin_thing
+    on "sgd0815"."thing"
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
+create index thing_block_range_closed
+    on "sgd0815"."thing"(coalesce(upper(block_range), 2147483647))
+ where coalesce(upper(block_range), 2147483647) < 2147483647;
+create index attr_0_0_thing_id
+    on sgd0815."thing" using btree ("id");
+create index attr_0_1_thing_big_thing
+    on sgd0815."thing" using gist ("big_thing", block_range);
+
+
+    create table "sgd0815"."scalar" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
+        "id"                 text not null,
+        "bool"               boolean,
+        "int"                int4,
+        "big_decimal"        numeric,
+        "string"             text,
+        "bytes"              bytea,
+        "big_int"            numeric,
+        "color"              "sgd0815"."color"
+    );
+
+    alter table "sgd0815"."scalar"
+        add constraint scalar_id_block_range_excl exclude using gist (id with =, block_range with &&);
+create index brin_scalar
+    on "sgd0815"."scalar"
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
+create index scalar_block_range_closed
+    on "sgd0815"."scalar"(coalesce(upper(block_range), 2147483647))
+ where coalesce(upper(block_range), 2147483647) < 2147483647;
+create index attr_1_0_scalar_id
+    on sgd0815."scalar" using btree ("id");
+
+
+    create table "sgd0815"."file_thing" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
+        causality_region     int not null,
+        "id"                 text not null
+    );
+
+    alter table "sgd0815"."file_thing"
+        add constraint file_thing_id_block_range_excl exclude using gist (id with =, block_range with &&);
+create index brin_file_thing
+    on "sgd0815"."file_thing"
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
+create index file_thing_block_range_closed
+    on "sgd0815"."file_thing"(coalesce(upper(block_range), 2147483647))
+ where coalesce(upper(block_range), 2147483647) < 2147483647;
+create index attr_2_0_file_thing_id
+    on sgd0815."file_thing" using btree ("id");
+"#;
+
+const BOOKS_GQL: &str = r#"type Author @entity {
+    id: ID!
+    name: String!
+    books: [Book!]! @derivedFrom(field: "author")
+}
+
+type Book @entity {
+    id: ID!
+    title: String!
+    content: Bytes!
+    pageCount: BigInt!
+    author: Author!
+}"#;
 
 const MUSIC_GQL: &str = r#"type Musician @entity {
     id: ID!

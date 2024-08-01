@@ -142,6 +142,7 @@ pub async fn test_module_latest(subgraph_id: &str, wasm_file: &str) -> WasmInsta
 pub trait WasmInstanceExt {
     fn invoke_export0_void(&mut self, f: &str) -> Result<(), Error>;
     fn invoke_export1_val_void<V: wasmtime::WasmTy>(&mut self, f: &str, v: V) -> Result<(), Error>;
+    #[allow(dead_code)]
     fn invoke_export0<R>(&mut self, f: &str) -> AscPtr<R>;
     fn invoke_export1<C, T, R>(&mut self, f: &str, arg: &T) -> AscPtr<R>
     where
@@ -1485,8 +1486,6 @@ async fn test_store_set_id() {
 async fn test_store_set_invalid_fields() {
     const UID: &str = "u1";
     const USER: &str = "User";
-    // const BID: &str = "0xdeadbeef";
-    // const BINARY: &str = "Binary";
     let schema = "
     type User @entity {
         id: ID!,

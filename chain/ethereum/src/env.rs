@@ -46,6 +46,10 @@ pub struct EnvVars {
     /// Set by the environment variable `GRAPH_ETHEREUM_JSON_RPC_TIMEOUT`
     /// (expressed in seconds). The default value is 180s.
     pub json_rpc_timeout: Duration,
+
+    /// Set by the environment variable `GRAPH_ETHEREUM_BLOCK_RECEIPTS_CHECK_TIMEOUT`
+    /// (expressed in seconds). The default value is 10s.
+    pub block_receipts_check_timeout: Duration,
     /// This is used for requests that will not fail the subgraph if the limit
     /// is reached, but will simply restart the syncing step, so it can be low.
     /// This limit guards against scenarios such as requesting a block hash that
@@ -114,6 +118,9 @@ impl From<Inner> for EnvVars {
             block_batch_size: x.block_batch_size,
             max_block_range_size: x.max_block_range_size,
             json_rpc_timeout: Duration::from_secs(x.json_rpc_timeout_in_secs),
+            block_receipts_check_timeout: Duration::from_secs(
+                x.block_receipts_check_timeout_in_seccs,
+            ),
             request_retries: x.request_retries,
             block_ingestor_max_concurrent_json_rpc_calls: x
                 .block_ingestor_max_concurrent_json_rpc_calls,
@@ -157,6 +164,8 @@ struct Inner {
     max_block_range_size: BlockNumber,
     #[envconfig(from = "GRAPH_ETHEREUM_JSON_RPC_TIMEOUT", default = "180")]
     json_rpc_timeout_in_secs: u64,
+    #[envconfig(from = "GRAPH_ETHEREUM_BLOCK_RECEIPTS_CHECK_TIMEOUT", default = "10")]
+    block_receipts_check_timeout_in_seccs: u64,
     #[envconfig(from = "GRAPH_ETHEREUM_REQUEST_RETRIES", default = "10")]
     request_retries: usize,
     #[envconfig(
@@ -175,6 +184,6 @@ struct Inner {
     target_triggers_per_block_range: u64,
     #[envconfig(from = "GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER", default = "0")]
     genesis_block_number: u64,
-    #[envconfig(from = "GRAPH_ETH_CALL_NO_GAS", default = "421613")]
+    #[envconfig(from = "GRAPH_ETH_CALL_NO_GAS", default = "421613,421614")]
     eth_call_no_gas: String,
 }

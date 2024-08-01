@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use graph::{
     anyhow::{bail, Context},
-    components::subgraph::{Setting, Settings},
+    components::{
+        adapter::{ChainId, IdentValidator, IdentValidatorError, NoopIdentValidator, ProviderName},
+        subgraph::{Setting, Settings},
+    },
     endpoint::EndpointMetrics,
     env::EnvVars,
     itertools::Itertools,
@@ -12,10 +15,40 @@ use graph::{
     },
     slog::Logger,
 };
-use graph_chain_ethereum::{NodeCapabilities, ProviderEthRpcMetrics};
-use graph_store_postgres::DeploymentPlacer;
+use graph_chain_ethereum::NodeCapabilities;
+use graph_store_postgres::{BlockStore, DeploymentPlacer};
 
-use crate::{chain::create_ethereum_networks_for_chain, config::Config};
+use crate::{config::Config, network_setup::Networks};
+
+/// Compare the NetIdentifier of all defined adapters with the existing
+/// identifiers on the ChainStore. If a ChainStore doesn't exist it will be show
+/// as an error. It's intended to be run again an environment that has already
+/// been setup by graph-node.
+pub async fn check_provider_genesis(networks: &Networks, store: Arc<BlockStore>) {
+    println!("Checking providers");
+    for (chain_id, ids) in networks.all_chain_identifiers().await.into_iter() {
+        let (_oks, errs): (Vec<_>, Vec<_>) = ids
+            .into_iter()
+            .map(|(provider, id)| {
+                id.map_err(IdentValidatorError::from)
+                    .and_then(|id| store.check_ident(chain_id, &id))
+                    .map_err(|e| (provider, e))
+            })
+            .partition_result();
+        let errs = errs
+            .into_iter()
+            .dedup_by(|e1, e2| e1.eq(e2))
+            .collect::<Vec<(ProviderName, IdentValidatorError)>>();
+
+        if errs.is_empty() {
+            println!("chain_id: {}: status: OK", chain_id);
+            continue;
+        }
+
+        println!("chain_id: {}: status: NOK", chain_id);
+        println!("errors: {:?}", errs);
+    }
+}
 
 pub fn place(placer: &dyn DeploymentPlacer, name: &str, network: &str) -> Result<(), Error> {
     match placer.place(name, network).map_err(|s| anyhow!(s))? {
@@ -138,15 +171,19 @@ pub async fn provider(
 
     let metrics = Arc::new(EndpointMetrics::mock());
     let caps = caps_from_features(features)?;
-    let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
-    let networks =
-        create_ethereum_networks_for_chain(&logger, eth_rpc_metrics, config, &network, metrics)
-            .await?;
-    let adapters = networks
-        .networks
-        .get(&network)
-        .ok_or_else(|| anyhow!("unknown network {}", network))?;
-    let adapters = adapters.all_cheapest_with(&caps);
+    let networks = Networks::from_config(
+        logger,
+        &config,
+        registry,
+        metrics,
+        Arc::new(NoopIdentValidator),
+        false,
+    )
+    .await?;
+    let network: ChainId = network.into();
+    let adapters = networks.ethereum_rpcs(network.clone());
+
+    let adapters = adapters.all_cheapest_with(&caps).await;
     println!(
         "deploy on network {} with features [{}] on node {}\neligible providers: {}",
         network,

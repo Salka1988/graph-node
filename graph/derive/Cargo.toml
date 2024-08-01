@@ -12,10 +12,10 @@ license.workspace = true
 proc-macro = true
 
 [dependencies]
-syn = { version = "1.0.98", features = ["full"] }
+syn = { workspace = true }
 quote = "1.0"
-proc-macro2 = "1.0.73"
-heck = "0.4"
+proc-macro2 = "1.0.85"
+heck = "0.5"
 
 [dev-dependencies]
-proc-macro-utils = "0.9.1"
+proc-macro-utils = "0.10.0"

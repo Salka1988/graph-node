@@ -4,9 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-futures = "0.1.23"
 graph = { path = "../../graph" }
 serde = { workspace = true }
 serde_derive = { workspace = true }
-tokio-tungstenite = "0.17"
-uuid = { version = "1.8.0", features = ["v4"] }
+tokio-tungstenite = "0.23"
+uuid = { version = "1.9.1", features = ["v4"] }

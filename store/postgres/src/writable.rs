@@ -36,6 +36,7 @@ use store::StoredDynamicDataSource;
 
 use crate::deployment_store::DeploymentStore;
 use crate::primary::DeploymentId;
+use crate::relational::index::IndexList;
 use crate::retry;
 use crate::{primary, primary::Site, relational::Layout, SubgraphStore};
 
@@ -65,6 +66,10 @@ impl WritableSubgraphStore {
 
     fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
         self.0.find_site(id)
+    }
+
+    fn load_indexes(&self, site: Arc<Site>) -> Result<IndexList, StoreError> {
+        self.0.load_indexes(site)
     }
 }
 
@@ -222,7 +227,8 @@ impl SyncStore {
                 Some((base_id, base_ptr)) => {
                     let src = self.store.layout(&base_id)?;
                     let deployment_entity = self.store.load_deployment(src.site.clone())?;
-                    Some((src, base_ptr, deployment_entity))
+                    let indexes = self.store.load_indexes(src.site.clone())?;
+                    Some((src, base_ptr, deployment_entity, indexes))
                 }
                 None => None,
             };
@@ -1656,6 +1662,16 @@ impl WritableStoreTrait for WritableStore {
             self.deployment_synced()?;
         } else {
             self.writer.start_batching();
+        }
+
+        if let Some(block_ptr) = self.block_ptr.lock().unwrap().as_ref() {
+            if block_ptr_to.number <= block_ptr.number {
+                return Err(constraint_violation!(
+                    "transact_block_operations called for block {} but its head is already at {}",
+                    block_ptr_to,
+                    block_ptr
+                ));
+            }
         }
 
         let batch = Batch::new(

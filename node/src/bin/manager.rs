@@ -2,6 +2,9 @@ use clap::{Parser, Subcommand};
 use config::PoolSize;
 use git_testament::{git_testament, render_testament};
 use graph::bail;
+use graph::blockchain::BlockHash;
+use graph::cheap_clone::CheapClone;
+use graph::components::adapter::ChainId;
 use graph::endpoint::EndpointMetrics;
 use graph::env::ENV_VARS;
 use graph::log::logger_with_levels;
@@ -14,13 +17,13 @@ use graph::{
     },
     url::Url,
 };
-use graph_chain_ethereum::{EthereumAdapter, EthereumNetworks};
+use graph_chain_ethereum::EthereumAdapter;
 use graph_graphql::prelude::GraphQlRunner;
 use graph_node::config::{self, Config as Cfg};
 use graph_node::manager::color::Terminal;
 use graph_node::manager::commands;
+use graph_node::network_setup::Networks;
 use graph_node::{
-    chain::create_all_ethereum_networks,
     manager::{deployment::DeploymentSearch, PanicSubscriptionManager},
     store_builder::StoreBuilder,
     MetricsContext,
@@ -32,7 +35,7 @@ use graph_store_postgres::{
     SubscriptionManager, PRIMARY_SHARD,
 };
 use lazy_static::lazy_static;
-use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::{collections::HashMap, num::ParseIntError, sync::Arc, time::Duration};
 const VERSION_LABEL_KEY: &str = "version";
 
@@ -187,7 +190,7 @@ pub enum Command {
             long,
             short,
             default_value = "20",
-            parse(try_from_str = parse_duration_in_secs)
+            value_parser = parse_duration_in_secs
         )]
         sleep: Duration,
     },
@@ -205,27 +208,27 @@ pub enum Command {
             long,
             short,
             default_value = "20",
-            parse(try_from_str = parse_duration_in_secs)
+            value_parser = parse_duration_in_secs
         )]
         sleep: Duration,
         /// The block hash of the target block
         #[clap(
-            required_unless_present = "start-block",
-            conflicts_with = "start-block",
+            required_unless_present = "start_block",
+            conflicts_with = "start_block",
             long,
             short = 'H'
         )]
         block_hash: Option<String>,
         /// The block number of the target block
         #[clap(
-            required_unless_present = "start-block",
-            conflicts_with = "start-block",
+            required_unless_present = "start_block",
+            conflicts_with = "start_block",
             long,
             short = 'n'
         )]
         block_number: Option<i32>,
         /// The deployments to rewind (see `help info`)
-        #[clap(required = true, min_values = 1)]
+        #[clap(required = true)]
         deployments: Vec<DeploymentSearch>,
     },
     /// Deploy and run an arbitrary subgraph up to a certain block
@@ -435,6 +438,11 @@ pub enum ConfigCommand {
         features: String,
         network: String,
     },
+
+    /// Compare the NetIdentifier of all defined adapters with the existing
+    /// identifiers on the ChainStore.
+    CheckProviders {},
+
     /// Show subgraph-specific settings
     ///
     /// GRAPH_EXPERIMENTAL_SUBGRAPH_SETTINGS can add a file that contains
@@ -534,26 +542,36 @@ pub enum ChainCommand {
         #[clap(subcommand)] // Note that we mark a field as a subcommand
         method: CheckBlockMethod,
         /// Chain name (must be an existing chain, see 'chain list')
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         chain_name: String,
     },
     /// Truncates the whole block cache for the given chain.
     Truncate {
         /// Chain name (must be an existing chain, see 'chain list')
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         chain_name: String,
         /// Skips confirmation prompt
         #[clap(long, short)]
         force: bool,
     },
 
+    /// Update the genesis block hash for a chain
+    UpdateGenesis {
+        #[clap(long, short)]
+        force: bool,
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        block_hash: String,
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        chain_name: String,
+    },
+
     /// Change the block cache shard for a chain
     ChangeShard {
         /// Chain name (must be an existing chain, see 'chain list')
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         chain_name: String,
         /// Shard name
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         shard: String,
     },
 
@@ -562,7 +580,7 @@ pub enum ChainCommand {
         #[clap(subcommand)]
         method: CallCacheCommand,
         /// Chain name (must be an existing chain, see 'chain list')
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         chain_name: String,
     },
 }
@@ -674,26 +692,26 @@ pub enum IndexCommand {
     /// This command may be time-consuming.
     Create {
         /// The deployment (see `help info`).
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         deployment: DeploymentSearch,
         /// The Entity name.
         ///
         /// Can be expressed either in upper camel case (as its GraphQL definition) or in snake case
         /// (as its SQL table name).
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         entity: String,
         /// The Field names.
         ///
         /// Each field can be expressed either in camel case (as its GraphQL definition) or in snake
         /// case (as its SQL colmun name).
-        #[clap(min_values = 1, required = true)]
+        #[clap(required = true)]
         fields: Vec<String>,
-        /// The index method. Defaults to `btree`.
+        /// The index method. Defaults to `btree` in general, and to `gist` when the index includes the `block_range` column
         #[clap(
             short, long, default_value = "btree",
-            possible_values = &["btree", "hash", "gist", "spgist", "gin", "brin"]
+            value_parser = clap::builder::PossibleValuesParser::new(&["btree", "hash", "gist", "spgist", "gin", "brin"])
         )]
-        method: String,
+        method: Option<String>,
 
         #[clap(long)]
         /// Specifies a starting block number for creating a partial index.
@@ -718,23 +736,21 @@ pub enum IndexCommand {
         #[clap(long, requires = "sql")]
         if_not_exists: bool,
         ///  The deployment (see `help info`).
-        #[clap(empty_values = false)]
         deployment: DeploymentSearch,
         /// The Entity name.
         ///
         /// Can be expressed either in upper camel case (as its GraphQL definition) or in snake case
         /// (as its SQL table name).
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         entity: String,
     },
 
     /// Drops an index for a given deployment, concurrently
     Drop {
         /// The deployment (see `help info`).
-        #[clap(empty_values = false)]
         deployment: DeploymentSearch,
         /// The name of the index to be dropped
-        #[clap(empty_values = false)]
+        #[clap(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         index_name: String,
     },
 }
@@ -912,7 +928,7 @@ impl Context {
         (primary_pool, mgr)
     }
 
-    fn store(self) -> Arc<Store> {
+    fn store(&self) -> Arc<Store> {
         let (store, _) = self.store_and_pools();
         store
     }
@@ -933,12 +949,12 @@ impl Context {
         .await
     }
 
-    fn store_and_pools(self) -> (Arc<Store>, HashMap<Shard, ConnectionPool>) {
+    fn store_and_pools(&self) -> (Arc<Store>, HashMap<Shard, ConnectionPool>) {
         let (subgraph_store, pools, _) = StoreBuilder::make_subgraph_store_and_pools(
             &self.logger,
             &self.node_id,
             &self.config,
-            self.fork_base,
+            self.fork_base.clone(),
             self.registry.clone(),
         );
 
@@ -951,8 +967,8 @@ impl Context {
             pools.clone(),
             subgraph_store,
             HashMap::default(),
-            BTreeMap::new(),
-            self.registry,
+            Vec::new(),
+            self.registry.cheap_clone(),
         );
 
         (store, pools)
@@ -989,11 +1005,11 @@ impl Context {
         ))
     }
 
-    async fn ethereum_networks(&self) -> anyhow::Result<EthereumNetworks> {
+    async fn networks(&self, block_store: Arc<BlockStore>) -> anyhow::Result<Networks> {
         let logger = self.logger.clone();
         let registry = self.metrics_registry();
         let metrics = Arc::new(EndpointMetrics::mock());
-        create_all_ethereum_networks(logger, registry, &self.config, metrics).await
+        Networks::from_config(logger, &self.config, registry, metrics, block_store, false).await
     }
 
     fn chain_store(self, chain_name: &str) -> anyhow::Result<Arc<ChainStore>> {
@@ -1008,12 +1024,13 @@ impl Context {
         self,
         chain_name: &str,
     ) -> anyhow::Result<(Arc<ChainStore>, Arc<EthereumAdapter>)> {
-        let ethereum_networks = self.ethereum_networks().await?;
+        let block_store = self.store().block_store();
+        let networks = self.networks(block_store).await?;
         let chain_store = self.chain_store(chain_name)?;
-        let ethereum_adapter = ethereum_networks
-            .networks
-            .get(chain_name)
-            .and_then(|adapters| adapters.cheapest())
+        let ethereum_adapter = networks
+            .ethereum_rpcs(chain_name.into())
+            .cheapest()
+            .await
             .ok_or(anyhow::anyhow!(
                 "Failed to obtain an Ethereum adapter for chain '{}'",
                 chain_name
@@ -1040,6 +1057,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut config = Cfg::load(&logger, &opt.clone().into()).context("Configuration error")?;
+    config.stores.iter_mut().for_each(|(_, shard)| {
+        shard.pool_size = PoolSize::Fixed(5);
+        shard.fdw_pool_size = PoolSize::Fixed(5);
+    });
 
     if opt.pool_size > 0 && !opt.cmd.use_configured_pool_size() {
         // Override pool size from configuration
@@ -1150,6 +1171,11 @@ async fn main() -> anyhow::Result<()> {
             use ConfigCommand::*;
 
             match cmd {
+                CheckProviders {} => {
+                    let store = ctx.store().block_store();
+                    let networks = ctx.networks(store.cheap_clone()).await?;
+                    Ok(commands::config::check_provider_genesis(&networks, store).await)
+                }
                 Place { name, network } => {
                     commands::config::place(&ctx.config.deployment, &name, &network)
                 }
@@ -1176,15 +1202,24 @@ async fn main() -> anyhow::Result<()> {
         }
         Pause { deployment } => {
             let sender = ctx.notification_sender();
-            commands::assign::pause_or_resume(ctx.primary_pool(), &sender, &deployment, true)
+            let pool = ctx.primary_pool();
+            let locator = &deployment.locate_unique(&pool)?;
+            commands::assign::pause_or_resume(pool, &sender, locator, true)
         }
+
         Resume { deployment } => {
             let sender = ctx.notification_sender();
-            commands::assign::pause_or_resume(ctx.primary_pool(), &sender, &deployment, false)
+            let pool = ctx.primary_pool();
+            let locator = &deployment.locate_unique(&pool).unwrap();
+
+            commands::assign::pause_or_resume(pool, &sender, locator, false)
         }
         Restart { deployment, sleep } => {
             let sender = ctx.notification_sender();
-            commands::assign::restart(ctx.primary_pool(), &sender, &deployment, sleep)
+            let pool = ctx.primary_pool();
+            let locator = &deployment.locate_unique(&pool).unwrap();
+
+            commands::assign::restart(pool, &sender, locator, sleep)
         }
         Rewind {
             force,
@@ -1194,13 +1229,16 @@ async fn main() -> anyhow::Result<()> {
             deployments,
             start_block,
         } => {
+            let notification_sender = ctx.notification_sender();
             let (store, primary) = ctx.store_and_primary();
+
             commands::rewind::run(
                 primary,
                 store,
                 deployments,
                 block_hash,
                 block_number,
+                &notification_sender,
                 force,
                 sleep,
                 start_block,
@@ -1315,6 +1353,29 @@ async fn main() -> anyhow::Result<()> {
                         shard,
                     )
                 }
+
+                UpdateGenesis {
+                    force,
+                    block_hash,
+                    chain_name,
+                } => {
+                    let store_builder = ctx.store_builder().await;
+                    let store = ctx.store().block_store();
+                    let networks = ctx.networks(store.cheap_clone()).await?;
+                    let chain_id = ChainId::from(chain_name);
+                    let block_hash = BlockHash::from_str(&block_hash)?;
+                    commands::chain::update_chain_genesis(
+                        &networks,
+                        store_builder.coord.cheap_clone(),
+                        store,
+                        &logger,
+                        chain_id,
+                        block_hash,
+                        force,
+                    )
+                    .await
+                }
+
                 CheckBlocks { method, chain_name } => {
                     use commands::check_blocks::{by_hash, by_number, by_range};
                     use CheckBlockMethod::*;

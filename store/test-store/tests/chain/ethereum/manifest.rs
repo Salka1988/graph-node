@@ -17,6 +17,7 @@ use graph::data_source::offchain::OffchainDataSourceKind;
 use graph::data_source::DataSourceTemplate;
 use graph::entity;
 use graph::env::ENV_VARS;
+use graph::prelude::web3::types::H256;
 use graph::prelude::{
     anyhow, async_trait, serde_yaml, tokio, BigDecimal, BigInt, DeploymentHash, Link, Logger,
     SubgraphManifest, SubgraphManifestValidationError, SubgraphStore, UnvalidatedSubgraphManifest,
@@ -547,6 +548,77 @@ specVersion: 0.0.8
     assert_eq!(
         sorted[7],
         ("string_example".into(), Value::String("bar".into()))
+    );
+}
+
+#[tokio::test]
+async fn parse_event_handlers_with_topics() {
+    const YAML: &str = "
+dataSources:
+  - kind: ethereum/contract
+    name: Factory
+    network: mainnet
+    source:
+      abi: Factory
+      startBlock: 9562480
+      endBlock: 9562481
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.4
+      language: wasm/assemblyscript
+      entities:
+        - TestEntity
+      file:
+        /: /ipfs/Qmmapping
+      abis:
+        - name: Factory
+          file:
+            /: /ipfs/Qmabi
+      eventHandlers:
+        - event: Test(address,string)
+          handler: handleTest
+          topic1: [\"0x0000000000000000000000000000000000000000000000000000000000000000\", \"0x0000000000000000000000000000000000000000000000000000000000000001\", \"0x0000000000000000000000000000000000000000000000000000000000000002\" ]
+          topic2: [\"0x0000000000000000000000000000000000000000000000000000000000000001\"]
+          topic3: [\"0x0000000000000000000000000000000000000000000000000000000000000002\"]
+schema:
+  file:
+    /: /ipfs/Qmschema
+specVersion: 1.2.0
+";
+
+    let manifest = resolve_manifest(YAML, SPEC_VERSION_1_2_0).await;
+    // Check if end block is parsed correctly
+    let data_source = manifest.data_sources.first().unwrap();
+    let topic1 = &data_source.as_onchain().unwrap().mapping.event_handlers[0].topic1;
+    let topic2 = &data_source.as_onchain().unwrap().mapping.event_handlers[0].topic2;
+    let topic3 = &data_source.as_onchain().unwrap().mapping.event_handlers[0].topic3;
+
+    assert_eq!(
+        Some(vec![
+            H256::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap(),
+            H256::from_str("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap(),
+            H256::from_str("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap()
+        ]),
+        topic1.clone()
+    );
+
+    assert_eq!(
+        Some(vec![H256::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        )
+        .unwrap()]),
+        topic2.clone()
+    );
+
+    assert_eq!(
+        Some(vec![H256::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000002"
+        )
+        .unwrap()]),
+        topic3.clone()
     );
 }
 
@@ -1337,6 +1409,8 @@ dataSources:
           calls:
             fake1: Factory[event.address].get(event.params.address)
             fake2: Factory[event.params.address].get(event.params.address)
+            fake3: Factory[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].get(event.address)
+            fake4: Factory[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].get(0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF)
 ";
 
     test_store::run_test_sequentially(|store| async move {
@@ -1368,6 +1442,6 @@ dataSources:
         // For more detailed tests of parsing CallDecls see the data_soure
         // module in chain/ethereum
         let decls = &ds.mapping.event_handlers[0].calls.decls;
-        assert_eq!(2, decls.len());
+        assert_eq!(4, decls.len());
     });
 }

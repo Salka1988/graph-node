@@ -8,16 +8,19 @@ use graph::components::trigger_processor::RunnableTriggers;
 use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
 use graph::env::ENV_VARS;
+use graph::futures03::future::try_join;
+use graph::futures03::stream::FuturesOrdered;
+use graph::futures03::TryStreamExt;
 use graph::prelude::ethabi::ethereum_types::H160;
 use graph::prelude::ethabi::{StateMutability, Token};
-use graph::prelude::futures03::future::try_join;
-use graph::prelude::futures03::stream::FuturesOrdered;
 use graph::prelude::lazy_static;
 use graph::prelude::regex::Regex;
 use graph::prelude::{Link, SubgraphManifestValidationError};
 use graph::slog::{debug, error, o, trace};
 use itertools::Itertools;
 use serde::de;
+use serde::de::Error as ErrorD;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::str::FromStr;
@@ -33,8 +36,8 @@ use graph::{
         ethabi::{Address, Contract, Event, Function, LogParam, ParamType, RawLog},
         serde_json, warn,
         web3::types::{Log, Transaction, H256},
-        BlockNumber, CheapClone, Deserialize, EthereumCall, LightEthereumBlock,
-        LightEthereumBlockExt, LinkResolver, Logger, TryStreamExt,
+        BlockNumber, CheapClone, EthereumCall, LightEthereumBlock, LightEthereumBlockExt,
+        LinkResolver, Logger,
     },
 };
 
@@ -131,6 +134,13 @@ impl blockchain::DataSource<Chain> for DataSource {
 
     fn address(&self) -> Option<&[u8]> {
         self.address.as_ref().map(|x| x.as_bytes())
+    }
+
+    fn has_declared_calls(&self) -> bool {
+        self.mapping
+            .event_handlers
+            .iter()
+            .any(|handler| !handler.calls.decls.is_empty())
     }
 
     fn handler_kinds(&self) -> HashSet<&str> {
@@ -396,17 +406,24 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn min_spec_version(&self) -> semver::Version {
-        self.mapping
-            .block_handlers
-            .iter()
-            .fold(MIN_SPEC_VERSION, |mut min, handler| {
-                min = match handler.filter {
-                    Some(BlockHandlerFilter::Polling { every: _ }) => SPEC_VERSION_0_0_8,
-                    Some(BlockHandlerFilter::Once) => SPEC_VERSION_0_0_8,
-                    _ => min,
-                };
-                min
-            })
+        let mut min_version = MIN_SPEC_VERSION;
+
+        for handler in &self.mapping.block_handlers {
+            match handler.filter {
+                Some(BlockHandlerFilter::Polling { every: _ }) | Some(BlockHandlerFilter::Once) => {
+                    min_version = std::cmp::max(min_version, SPEC_VERSION_0_0_8);
+                }
+                _ => {}
+            }
+        }
+
+        for handler in &self.mapping.event_handlers {
+            if handler.has_additional_topics() {
+                min_version = std::cmp::max(min_version, SPEC_VERSION_1_2_0);
+            }
+        }
+
+        min_version
     }
 
     fn runtime(&self) -> Option<Arc<Vec<u8>>> {
@@ -445,15 +462,13 @@ impl DataSource {
         })
     }
 
-    fn handlers_for_log<'a>(
-        &'a self,
-        log: &'a Log,
-    ) -> impl Iterator<Item = &'a MappingEventHandler> {
-        self.mapping.event_handlers.iter().filter(|handler| {
-            // Events without a topic should just be ignored. Making the RHS
-            // always `Some` ensures that
-            log.topics.first() == Some(&handler.topic0())
-        })
+    fn handlers_for_log(&self, log: &Log) -> Vec<MappingEventHandler> {
+        self.mapping
+            .event_handlers
+            .iter()
+            .filter(|handler| handler.matches(&log))
+            .cloned()
+            .collect::<Vec<_>>()
     }
 
     fn handler_for_call(&self, call: &EthereumCall) -> Result<Option<&MappingCallHandler>, Error> {
@@ -760,12 +775,11 @@ impl DataSource {
                 // associated transaction and instead have `transaction_hash == block.hash`,
                 // in which case we pass a dummy transaction to the mappings.
                 // See also ca0edc58-0ec5-4c89-a7dd-2241797f5e50.
-                let transaction = if log.transaction_hash != block.hash {
-                    block
-                        .transaction_for_log(&log)
-                        .context("Found no transaction for event")?
-                } else {
-                    // Infer some fields from the log and fill the rest with zeros.
+                // There is another special case in zkSync-era, where the transaction hash in this case would be zero
+                // See https://docs.zksync.io/zk-stack/concepts/blocks.html#fictive-l2-block-finalizing-the-batch
+                let transaction = if log.transaction_hash == block.hash
+                    || log.transaction_hash == Some(H256::zero())
+                {
                     Transaction {
                         hash: log.transaction_hash.unwrap(),
                         block_hash: block.hash,
@@ -774,6 +788,12 @@ impl DataSource {
                         from: Some(H160::zero()),
                         ..Transaction::default()
                     }
+                } else {
+                    // This is the general case where the log's transaction hash does not match the block's hash
+                    // and is not a special zero hash, implying a real transaction associated with this log.
+                    block
+                        .transaction_for_log(&log)
+                        .context("Found no transaction for event")?
                 };
 
                 let logging_extras = Arc::new(o! {
@@ -1533,6 +1553,12 @@ pub struct MappingCallHandler {
 pub struct MappingEventHandler {
     pub event: String,
     pub topic0: Option<H256>,
+    #[serde(deserialize_with = "deserialize_h256_vec", default)]
+    pub topic1: Option<Vec<H256>>,
+    #[serde(deserialize_with = "deserialize_h256_vec", default)]
+    pub topic2: Option<Vec<H256>>,
+    #[serde(deserialize_with = "deserialize_h256_vec", default)]
+    pub topic3: Option<Vec<H256>>,
     pub handler: String,
     #[serde(default)]
     pub receipt: bool,
@@ -1540,10 +1566,63 @@ pub struct MappingEventHandler {
     pub calls: CallDecls,
 }
 
+// Custom deserializer for H256 fields that removes the '0x' prefix before parsing
+fn deserialize_h256_vec<'de, D>(deserializer: D) -> Result<Option<Vec<H256>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<Vec<String>> = Option::deserialize(deserializer)?;
+
+    match s {
+        Some(vec) => {
+            let mut h256_vec = Vec::new();
+            for hex_str in vec {
+                // Remove '0x' prefix if present
+                let clean_hex_str = hex_str.trim_start_matches("0x");
+                // Ensure the hex string is 64 characters long, after removing '0x'
+                let padded_hex_str = format!("{:0>64}", clean_hex_str);
+                // Parse the padded string into H256, handling potential errors
+                h256_vec.push(
+                    H256::from_str(&padded_hex_str)
+                        .map_err(|e| D::Error::custom(format!("Failed to parse H256: {}", e)))?,
+                );
+            }
+            Ok(Some(h256_vec))
+        }
+        None => Ok(None),
+    }
+}
+
 impl MappingEventHandler {
     pub fn topic0(&self) -> H256 {
         self.topic0
             .unwrap_or_else(|| string_to_h256(&self.event.replace("indexed ", "")))
+    }
+
+    pub fn matches(&self, log: &Log) -> bool {
+        let matches_topic = |index: usize, topic_opt: &Option<Vec<H256>>| -> bool {
+            topic_opt.as_ref().map_or(true, |topic_vec| {
+                log.topics
+                    .get(index)
+                    .map_or(false, |log_topic| topic_vec.contains(log_topic))
+            })
+        };
+
+        if let Some(topic0) = log.topics.get(0) {
+            return self.topic0() == *topic0
+                && matches_topic(1, &self.topic1)
+                && matches_topic(2, &self.topic2)
+                && matches_topic(3, &self.topic3);
+        }
+
+        // Logs without topic0 should simply be skipped
+        false
+    }
+
+    pub fn has_additional_topics(&self) -> bool {
+        self.topic1.as_ref().map_or(false, |v| !v.is_empty())
+            || self.topic2.as_ref().map_or(false, |v| !v.is_empty())
+            || self.topic3.as_ref().map_or(false, |v| !v.is_empty())
     }
 }
 
@@ -1597,6 +1676,7 @@ impl CallDecl {
     fn address(&self, log: &Log, params: &[LogParam]) -> Result<H160, Error> {
         let address = match &self.expr.address {
             CallArg::Address => log.address,
+            CallArg::HexAddress(address) => *address,
             CallArg::Param(name) => {
                 let value = params
                     .iter()
@@ -1618,6 +1698,7 @@ impl CallDecl {
             .iter()
             .map(|arg| match arg {
                 CallArg::Address => Ok(Token::Address(log.address)),
+                CallArg::HexAddress(address) => Ok(Token::Address(*address)),
                 CallArg::Param(name) => {
                     let value = params
                         .iter()
@@ -1716,32 +1797,31 @@ impl FromStr for CallExpr {
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub enum CallArg {
+    HexAddress(Address),
     Address,
     Param(Word),
+}
+
+lazy_static! {
+    // Matches a 40-character hexadecimal string prefixed with '0x', typical for Ethereum addresses
+    static ref ADDR_RE: Regex = Regex::new(r"^0x[0-9a-fA-F]{40}$").unwrap();
 }
 
 impl FromStr for CallArg {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        fn invalid(s: &str) -> Result<CallArg, anyhow::Error> {
-            Err(anyhow!("invalid call argument `{}`", s))
+        if ADDR_RE.is_match(s) {
+            if let Ok(parsed_address) = Address::from_str(s) {
+                return Ok(CallArg::HexAddress(parsed_address));
+            }
         }
 
-        let mut parts = s.split(".");
-        match parts.next() {
-            Some("event") => { /* ok */ }
-            Some(_) => return Err(anyhow!("call arguments must start with `event`")),
-            None => return Err(anyhow!("empty call argument")),
-        }
-        match parts.next() {
-            Some("address") => Ok(CallArg::Address),
-            Some("params") => match parts.next() {
-                Some(s) => Ok(CallArg::Param(Word::from(s))),
-                None => invalid(s),
-            },
-            Some(s) => invalid(s),
-            None => invalid(s),
+        let mut parts = s.split('.');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("event"), Some("address"), None) => Ok(CallArg::Address),
+            (Some("event"), Some("params"), Some(param)) => Ok(CallArg::Param(Word::from(param))),
+            _ => Err(anyhow!("invalid call argument `{}`", s)),
         }
     }
 }
@@ -1775,4 +1855,14 @@ fn test_call_expr() {
     assert_eq!(expr.address, CallArg::Address);
     assert_eq!(expr.func, "growth");
     assert_eq!(expr.args, vec![]);
+
+    let expr: CallExpr = "Pool[0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF].growth(0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF)"
+        .parse()
+        .unwrap();
+    let call_arg =
+        CallArg::HexAddress(H160::from_str("0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF").unwrap());
+    assert_eq!(expr.abi, "Pool");
+    assert_eq!(expr.address, call_arg);
+    assert_eq!(expr.func, "growth");
+    assert_eq!(expr.args, vec![call_arg]);
 }

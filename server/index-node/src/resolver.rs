@@ -13,6 +13,7 @@ use graph::components::versions::VERSIONS;
 use graph::data::graphql::{object, IntoValue, ObjectOrInterface, ValueMap};
 use graph::data::subgraph::{status, DeploymentFeatures};
 use graph::data::value::Object;
+use graph::futures03::TryFutureExt;
 use graph::prelude::*;
 use graph_graphql::prelude::{a, ExecutionContext, Resolver};
 
@@ -266,7 +267,7 @@ impl<S: Store> IndexNodeResolver<S> {
 
         let chain = if let Ok(c) = self
             .blockchain_map
-            .get::<graph_chain_ethereum::Chain>(network.clone())
+            .get::<graph_chain_ethereum::Chain>(network.as_str().into())
         {
             c
         } else {
@@ -369,7 +370,7 @@ impl<S: Store> IndexNodeResolver<S> {
         let poi_fut = self
             .store
             .get_proof_of_indexing(&deployment_id, &indexer, block.clone());
-        let poi = match futures::executor::block_on(poi_fut) {
+        let poi = match graph::futures03::executor::block_on(poi_fut) {
             Ok(Some(poi)) => r::Value::String(format!("0x{}", hex::encode(poi))),
             Ok(None) => r::Value::Null,
             Err(e) => {
@@ -592,7 +593,7 @@ impl<S: Store> IndexNodeResolver<S> {
             }
             BlockchainKind::Starknet => {
                 let unvalidated_subgraph_manifest =
-                    UnvalidatedSubgraphManifest::<graph_chain_substreams::Chain>::resolve(
+                    UnvalidatedSubgraphManifest::<graph_chain_starknet::Chain>::resolve(
                         deployment_hash.clone(),
                         raw_yaml,
                         &self.link_resolver,
@@ -658,7 +659,7 @@ impl<S: Store> IndexNodeResolver<S> {
     ) -> Result<Option<BlockPtr>, QueryExecutionError> {
         macro_rules! try_resolve_for_chain {
             ( $typ:path ) => {
-                let blockchain = self.blockchain_map.get::<$typ>(network.to_string()).ok();
+                let blockchain = self.blockchain_map.get::<$typ>(network.as_str().into()).ok();
 
                 if let Some(blockchain) = blockchain {
                     debug!(

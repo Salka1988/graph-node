@@ -45,7 +45,7 @@ pub async fn chain(
     let static_block_stream = Arc::new(StaticStreamBuilder { chain: blocks });
     let block_stream_builder = Arc::new(MutexBlockStreamBuilder(Mutex::new(static_block_stream)));
 
-    let eth_adapters = Arc::new(EthereumNetworkAdapters::default());
+    let eth_adapters = Arc::new(EthereumNetworkAdapters::empty_for_testing());
 
     let chain = Chain::new(
         logger_factory,
@@ -137,6 +137,33 @@ pub fn push_test_log(block: &mut BlockWithTriggers<Chain>, payload: impl Into<St
         address: Address::zero(),
         topics: vec![tiny_keccak::keccak256(b"TestEvent(string)").into()],
         data: ethabi::encode(&[ethabi::Token::String(payload.into())]).into(),
+        block_hash: Some(H256::from_slice(block.ptr().hash.as_slice())),
+        block_number: Some(block.ptr().number.into()),
+        transaction_hash: Some(H256::from_low_u64_be(0)),
+        transaction_index: Some(0.into()),
+        log_index: Some(0.into()),
+        transaction_log_index: Some(0.into()),
+        log_type: None,
+        removed: None,
+    });
+    block
+        .trigger_data
+        .push(EthereumTrigger::Log(LogRef::FullLog(log, None)))
+}
+
+pub fn push_test_command(
+    block: &mut BlockWithTriggers<Chain>,
+    test_command: impl Into<String>,
+    data: impl Into<String>,
+) {
+    let log = Arc::new(Log {
+        address: Address::zero(),
+        topics: vec![tiny_keccak::keccak256(b"TestEvent(string,string)").into()],
+        data: ethabi::encode(&[
+            ethabi::Token::String(test_command.into()),
+            ethabi::Token::String(data.into()),
+        ])
+        .into(),
         block_hash: Some(H256::from_slice(block.ptr().hash.as_slice())),
         block_number: Some(block.ptr().number.into()),
         transaction_hash: Some(H256::from_low_u64_be(0)),

@@ -14,8 +14,9 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
-use futures::StreamExt;
+use graph::futures03::StreamExt;
 use graph::prelude::serde_json::{json, Value};
+use graph::prelude::web3::types::U256;
 use graph_tests::contract::Contract;
 use graph_tests::helpers::{run_checked, TestFile};
 use graph_tests::subgraph::Subgraph;
@@ -25,8 +26,15 @@ use tokio::task::JoinError;
 use tokio::time::sleep;
 
 type TestFn = Box<
-    dyn FnOnce(Subgraph) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Sync + Send,
+    dyn FnOnce(TestContext) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Sync
+        + Send,
 >;
+
+struct TestContext {
+    subgraph: Subgraph,
+    contracts: Vec<Contract>,
+}
 
 enum TestStatus {
     Ok,
@@ -90,15 +98,15 @@ struct TestCase {
 }
 
 impl TestCase {
-    fn new<T>(name: &str, test: fn(Subgraph) -> T) -> Self
+    fn new<T>(name: &str, test: fn(TestContext) -> T) -> Self
     where
         T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
     {
-        fn force_boxed<T>(f: fn(Subgraph) -> T) -> TestFn
+        fn force_boxed<T>(f: fn(TestContext) -> T) -> TestFn
         where
             T: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
         {
-            Box::new(move |sg| Box::pin(f(sg)))
+            Box::new(move |ctx| Box::pin(f(ctx)))
         }
 
         Self {
@@ -138,9 +146,14 @@ impl TestCase {
             status!(&self.name, "Subgraph ({}) has failed", subgraph.deployment);
         }
 
+        let ctx = TestContext {
+            subgraph: subgraph.clone(),
+            contracts: contracts.to_vec(),
+        };
+
         status!(&self.name, "Starting test");
         let subgraph2 = subgraph.clone();
-        let res = tokio::spawn(async move { (self.test)(subgraph).await }).await;
+        let res = tokio::spawn(async move { (self.test)(ctx).await }).await;
         let status = match res {
             Ok(Ok(())) => {
                 status!(&self.name, "Test succeeded");
@@ -160,24 +173,6 @@ impl TestCase {
             subgraph: Some(subgraph2),
             status,
         }
-    }
-}
-
-#[derive(Debug)]
-struct Output {
-    stdout: Option<String>,
-    stderr: Option<String>,
-}
-
-impl std::fmt::Display for Output {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(ref stdout) = self.stdout {
-            write!(f, "{}", stdout)?;
-        }
-        if let Some(ref stderr) = self.stderr {
-            write!(f, "{}", stderr)?
-        }
-        Ok(())
     }
 }
 
@@ -221,7 +216,8 @@ pub async fn query_succeeds(
 * the `cases` variable in `integration_tests`.
 */
 
-async fn test_int8(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_int8(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
     let resp = subgraph
@@ -253,7 +249,8 @@ async fn test_int8(subgraph: Subgraph) -> anyhow::Result<()> {
 * the `cases` variable in `integration_tests`.
 */
 
-async fn test_timestamp(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_timestamp(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
     let resp = subgraph
@@ -280,7 +277,8 @@ async fn test_timestamp(subgraph: Subgraph) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_block_handlers(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_block_handlers(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
     // test non-filtered blockHandler
@@ -417,20 +415,23 @@ async fn test_block_handlers(subgraph: Subgraph) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_eth_get_balance(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_eth_api(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
     let expected_response = json!({
         "foo": {
             "id": "1",
-            "value": "10000000000000000000000",
+            "balance": "10000000000000000000000",
+            "hasCode1": false,
+            "hasCode2": true,
         }
     });
 
     query_succeeds(
         "Balance should be right",
         &subgraph,
-        "{ foo(id: \"1\") { id value } }",
+        "{ foo(id: \"1\") { id balance hasCode1 hasCode2 } }",
         expected_response,
     )
     .await?;
@@ -438,7 +439,97 @@ async fn test_eth_get_balance(subgraph: Subgraph) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_ganache_reverts(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_topic_filters(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
+    assert!(subgraph.healthy);
+
+    let contract = ctx
+        .contracts
+        .iter()
+        .find(|x| x.name == "SimpleContract")
+        .unwrap();
+
+    contract
+        .call(
+            "emitAnotherTrigger",
+            (
+                U256::from(1),
+                U256::from(2),
+                U256::from(3),
+                "abc".to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    contract
+        .call(
+            "emitAnotherTrigger",
+            (
+                U256::from(1),
+                U256::from(1),
+                U256::from(1),
+                "abc".to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    contract
+        .call(
+            "emitAnotherTrigger",
+            (
+                U256::from(4),
+                U256::from(2),
+                U256::from(3),
+                "abc".to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    contract
+        .call(
+            "emitAnotherTrigger",
+            (
+                U256::from(4),
+                U256::from(4),
+                U256::from(3),
+                "abc".to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let exp = json!({
+        "anotherTriggerEntities": [
+            {
+                "a": "1",
+                "b": "2",
+                "c": "3",
+                "data": "abc",
+            },
+            {
+                "a": "1",
+                "b": "1",
+                "c": "1",
+                "data": "abc",
+            },
+        ],
+    });
+    query_succeeds(
+        "all overloads of the contract function are called",
+        &subgraph,
+        "{ anotherTriggerEntities(orderBy: id) {  a b c data } }",
+        exp,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn test_ganache_reverts(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
     let exp = json!({
@@ -466,12 +557,14 @@ async fn test_ganache_reverts(subgraph: Subgraph) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_host_exports(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_host_exports(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
     Ok(())
 }
 
-async fn test_non_fatal_errors(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_non_fatal_errors(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(!subgraph.healthy);
 
     let query = "query GetSubgraphFeatures($deployment: String!) {
@@ -515,7 +608,8 @@ async fn test_non_fatal_errors(subgraph: Subgraph) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_overloaded_functions(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_overloaded_functions(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     // all overloads of the contract function are called
     assert!(subgraph.healthy);
 
@@ -545,7 +639,8 @@ async fn test_overloaded_functions(subgraph: Subgraph) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_value_roundtrip(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_value_roundtrip(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
     let exp = json!({
@@ -563,7 +658,8 @@ async fn test_value_roundtrip(subgraph: Subgraph) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_remove_then_update(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_remove_then_update(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     assert!(subgraph.healthy);
 
     let exp = json!({
@@ -581,7 +677,8 @@ async fn test_remove_then_update(subgraph: Subgraph) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_poi_for_failed_subgraph(subgraph: Subgraph) -> anyhow::Result<()> {
+async fn test_poi_for_failed_subgraph(ctx: TestContext) -> anyhow::Result<()> {
+    let subgraph = ctx.subgraph;
     const INDEXING_STATUS: &str = r#"
     query statuses($subgraphName: String!) {
         statuses: indexingStatusesForSubgraphName(subgraphName: $subgraphName) {
@@ -677,6 +774,9 @@ async fn test_missing(_sg: Subgraph) -> anyhow::Result<()> {
 async fn integration_tests() -> anyhow::Result<()> {
     // Test "api-version-v0-0-4" was commented out in the original; what's
     // up with that?
+
+    let test_name_to_run = std::env::var("TEST_CASE").ok();
+
     let cases = vec![
         TestCase::new("ganache-reverts", test_ganache_reverts),
         TestCase::new("host-exports", test_host_exports),
@@ -687,9 +787,20 @@ async fn integration_tests() -> anyhow::Result<()> {
         TestCase::new("value-roundtrip", test_value_roundtrip),
         TestCase::new("int8", test_int8),
         TestCase::new("block-handlers", test_block_handlers),
-        TestCase::new("eth-get-balance", test_eth_get_balance),
         TestCase::new("timestamp", test_timestamp),
+        TestCase::new("ethereum-api-tests", test_eth_api),
+        TestCase::new("topic-filter", test_topic_filters),
     ];
+
+    // Filter the test cases if a specific test name is provided
+    let cases_to_run: Vec<_> = if let Some(test_name) = test_name_to_run {
+        cases
+            .into_iter()
+            .filter(|case| case.name == test_name)
+            .collect()
+    } else {
+        cases
+    };
 
     let contracts = Contract::deploy_all().await?;
 
@@ -703,7 +814,7 @@ async fn integration_tests() -> anyhow::Result<()> {
     status!("graph-node", "Starting graph-node");
     let mut graph_node_child_command = CONFIG.spawn_graph_node().await?;
 
-    let stream = tokio_stream::iter(cases)
+    let stream = tokio_stream::iter(cases_to_run)
         .map(|case| case.run(&contracts))
         .buffered(CONFIG.num_parallel_tests);
 

@@ -9,6 +9,17 @@ use graph::components::store::{DeploymentId, DeploymentLocator, SubscriptionMana
 use graph::components::subgraph::Settings;
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::data::subgraph::Graft;
+use graph::data::value::Word;
+use graph::futures01;
+use graph::futures01::future;
+use graph::futures01::stream;
+use graph::futures01::Future;
+use graph::futures01::Stream;
+use graph::futures03::compat::Future01CompatExt;
+use graph::futures03::compat::Stream01CompatExt;
+use graph::futures03::future::FutureExt;
+use graph::futures03::future::TryFutureExt;
+use graph::futures03::stream::TryStreamExt;
 use graph::prelude::{
     CreateSubgraphResult, SubgraphAssignmentProvider as SubgraphAssignmentProviderTrait,
     SubgraphRegistrar as SubgraphRegistrarTrait, *,
@@ -633,7 +644,7 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
         .await
         .map_err(SubgraphRegistrarError::ManifestValidationError)?;
 
-    let network_name = manifest.network_name();
+    let network_name: Word = manifest.network_name().into();
 
     let chain = chains
         .get::<C>(network_name.clone())
@@ -716,7 +727,7 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
             &manifest.schema,
             deployment,
             node_id,
-            network_name,
+            network_name.into(),
             version_switching_mode,
         )
         .map_err(SubgraphRegistrarError::SubgraphDeploymentError)

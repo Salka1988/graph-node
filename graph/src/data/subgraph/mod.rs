@@ -61,6 +61,8 @@ use std::sync::Arc;
 
 use super::{graphql::IntoValue, value::Word};
 
+pub const SUBSTREAMS_KIND: &str = "substreams";
+
 /// Deserialize an Address (with or without '0x' prefix).
 fn deserialize_address<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
 where
@@ -531,6 +533,10 @@ pub struct DeploymentFeatures {
     pub data_source_kinds: Vec<String>,
     pub network: String,
     pub handler_kinds: Vec<String>,
+    pub has_declared_calls: bool,
+    pub has_bytes_as_ids: bool,
+    pub has_aggregations: bool,
+    pub immutable_entities: Vec<String>,
 }
 
 impl IntoValue for DeploymentFeatures {
@@ -543,6 +549,10 @@ impl IntoValue for DeploymentFeatures {
             dataSources: self.data_source_kinds,
             handlers: self.handler_kinds,
             network: self.network,
+            hasDeclaredEthCalls: self.has_declared_calls,
+            hasBytesAsIds: self.has_bytes_as_ids,
+            hasAggregations: self.has_aggregations,
+            immutableEntities: self.immutable_entities
         }
     }
 }
@@ -795,6 +805,14 @@ impl<C: Blockchain> SubgraphManifest<C> {
     pub fn deployment_features(&self) -> DeploymentFeatures {
         let unified_api_version = self.unified_mapping_api_version().ok();
         let network = self.network_name();
+        let has_declared_calls = self.data_sources.iter().any(|ds| ds.has_declared_calls());
+        let has_aggregations = self.schema.has_aggregations();
+        let immutable_entities = self
+            .schema
+            .immutable_entities()
+            .map(|s| s.to_string())
+            .collect_vec();
+
         let api_version = unified_api_version
             .map(|v| v.version().map(|v| v.to_string()))
             .flatten();
@@ -838,6 +856,10 @@ impl<C: Blockchain> SubgraphManifest<C> {
                 .map(|s| s.to_string())
                 .collect_vec(),
             network,
+            has_declared_calls,
+            has_bytes_as_ids: self.schema.has_bytes_as_ids(),
+            immutable_entities,
+            has_aggregations,
         }
     }
 
@@ -940,6 +962,14 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
                 .try_collect::<Vec<_>>(),
         )
         .await?;
+
+        let is_substreams = data_sources.iter().any(|ds| ds.kind() == SUBSTREAMS_KIND);
+        if is_substreams && ds_count > 1 {
+            return Err(anyhow!(
+                "A Substreams-based subgraph can only contain a single data source."
+            )
+            .into());
+        }
 
         for ds in &data_sources {
             ensure!(

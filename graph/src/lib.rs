@@ -45,8 +45,11 @@ pub use task_spawn::{
 
 pub use anyhow;
 pub use bytes;
+pub use futures01;
+pub use futures03;
 pub use graph_derive as derive;
 pub use http;
+pub use http0;
 pub use http_body_util;
 pub use hyper;
 pub use hyper_util;
@@ -79,14 +82,6 @@ pub mod prelude {
     pub use diesel;
     pub use envconfig;
     pub use ethabi;
-    pub use futures::future;
-    pub use futures::prelude::*;
-    pub use futures::stream;
-    pub use futures03;
-    pub use futures03::compat::{Future01CompatExt, Sink01CompatExt, Stream01CompatExt};
-    pub use futures03::future::{FutureExt as _, TryFutureExt};
-    pub use futures03::sink::SinkExt as _;
-    pub use futures03::stream::{StreamExt as _, TryStreamExt};
     pub use hex;
     pub use isatty;
     pub use lazy_static::lazy_static;
@@ -118,6 +113,7 @@ pub mod prelude {
 
     pub use crate::blockchain::{BlockHash, BlockPtr};
 
+    pub use crate::components::adapter;
     pub use crate::components::ethereum::{
         EthereumBlock, EthereumBlockWithCalls, EthereumCall, LightEthereumBlock,
         LightEthereumBlockExt,

@@ -92,8 +92,8 @@ impl TryInto<web3::types::Call> for Call {
                 .map_or_else(|| U256::from(0), |v| v.into()),
             gas: U256::from(self.gas_limit),
             input: Bytes::from(self.input.clone()),
-            call_type: CallType::from_i32(self.call_type)
-                .ok_or_else(|| format_err!("invalid call type: {}", self.call_type,))?
+            call_type: CallType::try_from(self.call_type)
+                .map_err(|_| graph::anyhow::anyhow!("invalid call type: {}", self.call_type))?
                 .into(),
         })
     }
@@ -192,19 +192,7 @@ impl<'a> TryInto<web3::types::Transaction> for TransactionTraceAt<'a> {
                     .from
                     .try_decode_proto("transaction from address")?,
             ),
-            to: match self.trace.calls.len() {
-                0 => Some(self.trace.to.try_decode_proto("transaction to address")?),
-                _ => {
-                    match CallType::from_i32(self.trace.calls[0].call_type).ok_or_else(|| {
-                        format_err!("invalid call type: {}", self.trace.calls[0].call_type,)
-                    })? {
-                        CallType::Create => {
-                            None // we don't want the 'to' address on a transaction that creates the contract, to align with RPC behavior
-                        }
-                        _ => Some(self.trace.to.try_decode_proto("transaction to")?),
-                    }
-                }
-            },
+            to: get_to_address(self.trace)?,
             value: self.trace.value.as_ref().map_or(U256::zero(), |x| x.into()),
             gas_price: self.trace.gas_price.as_ref().map(|x| x.into()),
             gas: U256::from(self.trace.gas_limit),
@@ -312,13 +300,14 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                                     match t.calls.len() {
                                         0 => None,
                                         _ => {
-                                            match CallType::from_i32(t.calls[0].call_type)
-                                                .ok_or_else(|| {
-                                                    format_err!(
+                                            match CallType::try_from(t.calls[0].call_type).map_err(
+                                                |_| {
+                                                    graph::anyhow::anyhow!(
                                                         "invalid call type: {}",
                                                         t.calls[0].call_type,
                                                     )
-                                                })? {
+                                                },
+                                            )? {
                                                 CallType::Create => {
                                                     Some(t.calls[0].address.try_decode_proto(
                                                         "transaction contract address",
@@ -334,9 +323,9 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                                     .iter()
                                     .map(|l| LogAt::new(l, self, t).try_into())
                                     .collect::<Result<Vec<_>, Error>>()?,
-                                status: TransactionTraceStatus::from_i32(t.status)
-                                    .ok_or_else(|| {
-                                        format_err!(
+                                status: TransactionTraceStatus::try_from(t.status)
+                                    .map_err(|_| {
+                                        graph::anyhow::anyhow!(
                                             "invalid transaction trace status: {}",
                                             t.status
                                         )
@@ -353,7 +342,7 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                                     .logs_bloom
                                     .try_decode_proto("transaction logs bloom")?,
                                 from: t.from.try_decode_proto("transaction from")?,
-                                to: Some(t.to.try_decode_proto("transaction to")?),
+                                to: get_to_address(t)?,
                                 transaction_type: None,
                                 effective_gas_price: None,
                             })
@@ -538,5 +527,20 @@ mod test {
             // if you're confused when reading this, format needs {{ to escape {
             format!(r#"{{"block":{{"data":null,"timestamp":"{}"}}}}"#, now)
         );
+    }
+}
+
+fn get_to_address(trace: &TransactionTrace) -> Result<Option<H160>, Error> {
+    // Try to detect contract creation transactions, which have no 'to' address
+    let is_contract_creation = trace.to.len() == 0
+        || trace.calls.get(0).map_or(false, |call| {
+            CallType::try_from(call.call_type)
+                .map_or(false, |call_type| call_type == CallType::Create)
+        });
+
+    if is_contract_creation {
+        Ok(None)
+    } else {
+        Ok(Some(trace.to.try_decode_proto("transaction to address")?))
     }
 }
